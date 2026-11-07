@@ -1,0 +1,56 @@
+[
+  {
+    "name": "turn on dark mode",
+    "command": "turn on dark mode",
+    "expect": {"dark": "on"}
+  },
+  {
+    "name": "dim the lights",
+    "command": "dim the lights",
+    "expect": {"dark": "on"}
+  },
+  {
+    "name": "stop the animations",
+    "command": "stop the animations",
+    "expect": {"reduce_motion": "on"}
+  },
+  {
+    "name": "increase the contrast",
+    "command": "increase the contrast",
+    "expect": {"contrast": "on"}
+  },
+  {
+    "name": "turn on dark mode and save",
+    "command": "turn on dark mode and save",
+    "expect": {"dark": "on", "saved": "yes"}
+  },
+  {
+    "name": "turn off email notifications and save",
+    "command": "turn off email notifications and save",
+    "expect": {"notifications": "off", "saved": "yes"}
+  },
+  {
+    "name": "set digest to weekly",
+    "command": "set the digest frequency to weekly",
+    "expect": {"digest": "Weekly"},
+    "value": "Weekly"
+  },
+  {
+    "name": "save my changes",
+    "command": "save my changes",
+    "expect": {"saved": "yes"}
+  },
+  {
+    "name": "quiet my inbox",
+    "command": "quiet my inbox",
+    "expect": {"notifications": "off"},
+    "stretch": true
+  },
+  {
+    "name": "out of scope: report state",
+    "command": "what is the current state?",
+    "expect": {},
+    "expect_no_action": true,
+    "stretch": true
+  }
+]
