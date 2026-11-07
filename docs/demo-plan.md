@@ -117,6 +117,7 @@ Flat on purpose; no package layout.
 
 ```
 docs/demo-plan.md
+docs/research-decision-model-landscape.md
 spike.html
 spike.py
 scenarios.json
@@ -145,16 +146,35 @@ Spike-only safety: fixture origin, 5-action limit, no credential or payment fiel
 
 The trust moment is a paraphrase making the browser do the right thing — not a scripted selector.
 
-## 9. Next steps (optional)
+## 9. Next steps
 
-- **Voice.** Add local ASR (`whisper.cpp` or `faster-whisper`) in front of the same loop. Replace typed input with the transcript, keep typed input as fallback. This tests ASR + decision without changing the core.
-- **Real page.** Point the loop at one stable public page after the fixture passes. Expect weaker snapshots and more candidates; cap harder, use `browser_find`. Do not claim general web competence from one page.
-- **Limited real demo.** Run one real task end-to-end (e.g. change a real site's theme and save) with a human confirming each action. Same code, real target.
-- **Alternate provider.** `jev-1.13-free` via OpenCode answers the same request shape at `https://opencode.ai/inference/systemone/v1/systemone`. It supports images (send `TypeSafe-Danger-Zone-Images: true`) and was free and fast in our test: ~0.25 s text, ~0.42 s image. Use it as a quality/latency comparison. Jev 1.14 adds Box (coordinates) if screenshots become the input.
+Ordered by value. Prior art and measurements for each: `docs/research-decision-model-landscape.md`.
+
+**Decision quality (small changes, do first)**
+
+- **Fan-out side-questions.** Add `is_command` ("is this addressed to the browser at all?"), `complete`, `destructive`, and `is_correction` as extra question heads in the *same* d1 request as the target choice. Replaces the separate `completion_check` round-trip and adds the safety gates the whole ecosystem uses.
+- **Contrastive criteria.** Write each option as `{what, not_for, examples}` (TypeSafe's shape; plain text works for d1) instead of a single purpose line.
+- **Action outcomes in state.** Keep `said / action / target / outcome` ("navigated to …") for the last 3 actions, so "no, the other one" and "back to the results" become resolvable.
+- **Span extraction.** For any typed value, regex-extract candidate spans from the command and let d1 pick one. The model never produces text — already true in scenario mode; needed for the REPL and voice.
+
+**Voice**
+
+- **Streaming partials.** `faster-whisper` (or whisper.cpp) partial hypotheses → debounce ~200 ms → the same decide loop. `complete`/silence gates let closed-set actions fire mid-sentence ("go back") while payload intents wait for the final transcript. This is exactly how `jev-voice-browser` acts before you finish the sentence (~300 ms decisions, 2 in-flight, older cancelled).
+
+**Beyond the fixture**
+
+- **Real page.** One stable public page. Expect the real limits: no purpose map, messy accessible names, 100+ candidates (cap harder, viewport-first), iframes invisible, below-fold needs scrolling. This is where an auto-generated purpose compiler earns its keep.
+- **Limited real demo.** One real task end-to-end with a human confirming each action. Same code, real target, no general-web claims.
+- **Numbered overlays.** On low-confidence targets, badge the top 2–3 candidates on the page and accept a spoken number. Deterministic, no model call, and a genuine accessibility affordance.
+
+**Provider / input options**
+
+- **Jev comparison.** `jev-1.13-free` via OpenCode answers the same request shape (~0.25 s text, ~0.42 s image with `TypeSafe-Danger-Zone-Images: true`). A head-to-head on the same snapshot is worth it: Jev's calibrated probabilities vs d1's concentration, hosted ~0.3 s vs local ~1.3 s. jev-ultrafast's dynamic per-operation target heads are the reference if target+action ever need to be joint.
+- **Screenshot path.** `browser_snapshot {boxes: true}` adds viewport coordinates per element; Jev 1.14 Box emits boxes natively; OmniParser is the fallback where no DOM/AX exists. Only after the tree path is exhausted.
 
 ## 10. Input and runtime options to evaluate
 
-- **Accessibility tree vs screenshots.** The tree gives refs and roles for free and is the spike's default. Screenshots need set-of-marks or coordinate grounding: d1 cannot emit coordinates; Jev 1.14 Box can. Screenshot prefill also adds latency. Try only after the tree path works.
+- **Accessibility tree vs screenshots.** The tree gives refs and roles for free and stays the default. Screenshots need set-of-marks or coordinate grounding (`boxes: true`, Jev 1.14 Box, OmniParser) and add prefill latency. Try only after the tree path is exhausted.
 - **Ollama vs MLX.** d1 MLX exports exist (`d1-3B-MLX-fp16/8bit/4bit`, `mlx-vlm>=0.7.8`, `/v1/decisions`). MLX may cut latency on Apple Silicon, but we have not measured it; vendor numbers are not comparable to our Ollama runs. Measure before switching.
 
 ## 11. Corrections and measurements
@@ -177,6 +197,8 @@ Takeaway: option wording is the dominant variable. The hand-written purpose map 
 
 **Implementation result (2026-11-07):** the spike passes 8/8 core scenarios and 10/10 including stretch on an M2. Warm d1 calls are ~1.2–1.8 s; the full `--all` run takes about a minute.
 
+**Related work:** the same architecture (closed choice, select-don't-generate, code-owned control flow) is what the Jev ecosystem ships — `jev-voice-browser`, `typesafe-computer-use`, `browser-use/jev-ultrafast`. See `docs/research-decision-model-landscape.md` for the survey, their measured numbers, and their stated limits.
+
 ## 12. Risks
 
 | Risk | Mitigation |
@@ -184,6 +206,8 @@ Takeaway: option wording is the dominant variable. The hand-written purpose map 
 | d1 can't ground paraphrases | rich purposes, ≤15 options, `unsure` escape, kill criterion |
 | hand-written purposes overstate generality | state it; auto-generate later |
 | fixture is too friendly | distractors + paraphrases; no real-web claims |
+| raw-control action space caps generality (WebMCP: 25/49 raw vs 49/49 with site tools) | keep commands short; task-level actions or exposed site tools later |
+| page text is untrusted (indirect prompt injection) | fixture-only for now; treat snapshot text as data; destructive gate + confirm before real pages |
 | MCP browser isn't the user's session | accept; attach via extension/CDP later |
-| d1 has no memory | resend compact state + last 1–3 actions |
+| d1 has no memory | resend compact state + last 1–3 actions with outcomes |
 | model/API drift | pin Ollama version and model digest in the log |
