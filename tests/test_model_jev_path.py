@@ -68,3 +68,17 @@ def test_jev_ordinal_pin_overrides_wrong_target_choice(monkeypatch):
     d = _run("click the first link", answers, monkeypatch)
     assert d.target_id == "e01"
     assert d.ambiguous is False
+
+
+def test_jev_ordinal_pin_floors_a_hesitant_intent(monkeypatch):
+    answers = {
+        "is_command": _noul(0.4),
+        "complete": _noul(1.0),
+        "intent": _choice("none", {"none": 0.6, "click": 0.4}),
+        "target": _choice("none"),
+    }
+    d = _run("click the first link", answers, monkeypatch)
+    assert d.intent == "click"
+    assert d.target_id == "e01"
+    assert d.intent_confidence >= 0.85
+    assert d.is_command_confidence >= 0.85

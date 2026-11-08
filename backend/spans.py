@@ -22,6 +22,132 @@ SITE_ALIASES = {
     "netflix": "netflix.com", "linkedin": "linkedin.com",
 }
 
+_TLDS = "com|org|net|io|ai|dev|co|edu|gov|de|uk|us|app|xyz|info|me|tv|ch|at|fr|nl|es|it"
+_URL_CANDIDATE_RE = re.compile(rf"(?:https?://)?(?:[a-z0-9-]+\.)+(?:{_TLDS})(?:/[^\s]*)?", re.I)
+_URL_VERB_RE = re.compile(r"\b(?:go\s+to|open|navigate\s+to|visit|check)\s+", re.I)
+
+_PAYLOAD_VERBS = [
+    re.compile(r"\b(?:search|look)\s+(?:for|up)\s+", re.I),
+    re.compile(r"\bsearch\s+(?:on\s+)?(?:google|duckduckgo|wikipedia|youtube|github|amazon|reddit|twitter|x|hacker\s+news|the\s+web)\s+for\s+", re.I),
+    re.compile(r"\bsearch\s+", re.I),
+    re.compile(r"\bgoogle\s+", re.I),
+    re.compile(r"\bfind\s+", re.I),
+    re.compile(r"\btype\s+(?:in\s+)?", re.I),
+    re.compile(r"\benter\s+", re.I),
+    re.compile(r"\bwrite\s+", re.I),
+    re.compile(r"\bput\s+", re.I),
+    re.compile(r"\bfill\s+(?:in\s+)?", re.I),
+]
+
+_TRAILING_DEST_RE = re.compile(
+    r"\s+(?:in|into|on|inside|to)\s+(?:the\s+)?(?:[\w-]+\s+){0,4}?"
+    r"(?:box|field|input|bar|form|textarea|search|wikipedia|youtube|google|duckduckgo|github|amazon|reddit|twitter|x|web)\b.*$",
+    re.I,
+)
+_TRAILING_PAGE_RE = re.compile(r"\s+(?:on|in|over)\s+(?:this|the)\s+(?:page|site)\b.*$", re.I)
+_LEADING_SITE_RE = re.compile(
+    r"^(?:on\s+|in\s+)?(?:google|duckduckgo|wikipedia|youtube|github|amazon|reddit|twitter|x|hacker\s+news|the\s+web)\s+(?:for\s+)?",
+    re.I,
+)
+_LEADING_FILLER_RE = re.compile(r"^(?:(?:and|now|then|also|please)\b[\s,;]*)+", re.I)
+
+
+def clean_transcript(text: str) -> str:
+    return " ".join((text or "").split()).strip()
+
+
+def _strip_payload(text: str) -> str:
+    text = _LEADING_FILLER_RE.sub("", text)
+    text = _LEADING_SITE_RE.sub("", text)
+    text = _TRAILING_PAGE_RE.sub("", text)
+    text = _TRAILING_DEST_RE.sub("", text)
+    return text.strip(" \t,;.!?\"'")
+
+
+def _push_unique(out: list[str], value: str) -> None:
+    value = _strip_payload(value)
+    if not value or len(value) > 120:
+        return
+    if any(existing.lower() == value.lower() for existing in out):
+        return
+    out.append(value)
+
+
+def extract_text_candidates(transcript: str) -> list[str]:
+    """Over-generate payload spans; Jev only picks one. Never returns the whole transcript."""
+    text = clean_transcript(transcript)
+    if not text:
+        return []
+    out: list[str] = []
+
+    for match in re.finditer(r"[\"“”']([^\"“”']{1,120})[\"“”']", text):
+        _push_unique(out, match.group(1))
+
+    verb_matches = []
+    for pattern in _PAYLOAD_VERBS:
+        verb_matches.extend(pattern.finditer(text))
+    verb_matches.sort(key=lambda m: (m.start(), -len(m.group())))
+
+    seen_starts: set[int] = set()
+    for match in verb_matches:
+        if match.start() in seen_starts:
+            continue
+        seen_starts.add(match.start())
+        tail = text[match.end():]
+        stripped = _TRAILING_DEST_RE.sub("", tail)
+        comma = re.search(r"[,;]", tail)
+        if comma:
+            _push_unique(out, _TRAILING_DEST_RE.sub("", tail[:comma.start()]))
+        _push_unique(out, stripped)
+        if stripped != tail:
+            _push_unique(out, tail)
+
+    for_idx = text.lower().find(" for ")
+    if for_idx >= 0:
+        _push_unique(out, text[for_idx + 5:])
+
+    return out[:8]
+
+
+def _normalize_spoken_url(text: str) -> str:
+    text = clean_transcript(text).lower()
+    text = re.sub(r"\s+dot\s+", ".", text)
+    text = re.sub(r"\s*\.\s*", ".", text)
+    text = re.sub(r"\s+slash\s+", "/", text)
+    text = re.sub(r"\bwww\s+", "www.", text)
+    return text
+
+
+def extract_url_candidates(transcript: str) -> list[str]:
+    text = _normalize_spoken_url(transcript)
+    if not text:
+        return []
+    out: list[str] = []
+
+    for match in _URL_CANDIDATE_RE.finditer(text):
+        value = match.group(0).rstrip(".,!?")
+        if value not in out:
+            out.append(value)
+
+    for match in _URL_VERB_RE.finditer(text):
+        tail = text[match.end():]
+        tail = re.split(r"[,;]", tail, maxsplit=1)[0]
+        key = tail.strip(" \t.!?\"'")
+        if key in SITE_ALIASES and SITE_ALIASES[key] not in out:
+            out.append(SITE_ALIASES[key])
+
+    return out[:6]
+
+
+def is_comma_bounded(transcript: str, text: str) -> bool:
+    if not text:
+        return False
+    start = transcript.lower().find(text.lower())
+    if start < 0:
+        return False
+    tail = transcript[start + len(text):]
+    return bool(re.search(r"[,;]", tail))
+
 
 def extract_type_text(transcript: str) -> Optional[str]:
     """"type Sarah Chen in the name field" -> "Sarah Chen" """

@@ -88,6 +88,17 @@ def noul(answers: dict[str, Any], key: str, default: float = 0.0) -> float:
     return default
 
 
+def score(answers: dict[str, Any], key: str) -> Optional[float]:
+    """Ordered-level question -> score, or None when missing/malformed."""
+    a = answers.get(key)
+    if not isinstance(a, dict):
+        return None
+    try:
+        return float(a.get("score"))
+    except (TypeError, ValueError):
+        return None
+
+
 def choice(answers: dict[str, Any], key: str) -> tuple[Optional[str], float, dict[str, float]]:
     """Multiple-choice question -> (picked_key, confidence, probabilities)."""
     a = answers.get(key)

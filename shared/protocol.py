@@ -12,6 +12,7 @@ class Transcript:
     id: Optional[int] = None  # groups a stream of partials + their final into one utterance
                                # (set by audio/apple_transcriber.py; None for typed/panel input,
                                # which naturally opts those sources out of early-commit tracking)
+    silent_ms: float = 0.0    # set only by the silence retry: how long the user has been quiet
 
 
 # ---- Person 2 (perception) produces these ----
@@ -79,3 +80,10 @@ class Decision:
     # (those threshold at 0.5; early-commit-on-partials needs the stricter 0.85/0.8 bars).
     is_command_confidence: float = 1.0
     complete_confidence: float = 1.0
+    intent_confidence: float = 1.0
+    # Rolling-decision extras. act_now is None for callers that only know final transcripts
+    # (keyword fallback / old tests); production Jev decisions always set it.
+    act_now: Optional[str] = None      # not_a_command | incomplete | clause_complete | utterance_complete
+    is_correction: bool = False        # user is reversing/redirecting the previous action
+    payload_bounded: bool = False      # free text ended at a comma/semicolon, so it can commit early
+    target_top_prob: float = 1.0       # probability of the picked target, for disambiguation

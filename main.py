@@ -5,8 +5,10 @@
 import asyncio
 import logging
 import os
+import re
 import time
 from typing import Optional
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
@@ -15,7 +17,7 @@ from audio.apple_transcriber import AppleSpeechTranscriber
 from audio.apple_transcriber import is_available as apple_speech_available
 from audio.transcriber import TypedTranscriber
 from backend import jev, policy, spans
-from backend.early_commit import EarlyCommitTracker
+from backend.context import ConversationContext, Turn
 from backend.model import decide
 from backend.scheduler import Scheduler
 from executor import act, undo
@@ -46,8 +48,39 @@ RESUME_LISTENING_PHRASES = {"start listening", "resume listening"}
 TOGGLE_LISTENING_PHRASES = {"toggle listening"}
 
 
+def _site_of(url: str) -> str:
+    try:
+        return (urlsplit(url).hostname or "").removeprefix("www.")
+    except Exception:
+        return ""
+
+
+def _short_url(url: str) -> str:
+    return url.removeprefix("https://").removeprefix("http://").removeprefix("www.")[:80]
+
+
 def _target_name(d: Decision, cands: list[Element]) -> str:
     return next((e.name for e in cands if e.id == d.target_id), d.target_id or "")
+
+
+def _consumed_prefix(raw_text: str, current: str, act_now: Optional[str], is_final: bool,
+                     start_at: int = 0) -> str:
+    """Physical-text prefix handled by this decision. A comma-bounded clause committed
+    before the utterance ends consumes only up to that comma, so the final transcript
+    can still be sliced into the next command."""
+    full = " ".join(raw_text.split())
+    current_n = " ".join(current.split())
+    idx = full.lower().find(current_n.lower(), start_at)
+    if idx < 0:
+        idx = full.lower().find(current_n.lower())
+    if idx < 0:
+        return current_n
+    end = idx + len(current_n)
+    if act_now == "clause_complete" and not is_final:
+        boundary = re.search(r"[,;]", full[idx:end])
+        if boundary:
+            end = idx + boundary.end()
+    return full[:end]
 
 
 def _parse_ordinal_reply(text: str, count: int) -> Optional[int]:
@@ -85,7 +118,6 @@ async def main() -> None:
             ctx = await browser.new_context(bypass_csp=True)
 
         active_page = None  # tab commands can change which Page subsequent commands act on
-        recent_actions: list[str] = []
         checkpoints: list[undo.Checkpoint] = []  # for smart "go back"/"undo"
         last_command_ts = 0.0  # when the most recent user command STARTED executing
         last_scroll: Optional[Decision] = None  # for "keep scrolling"/"more"/"again"
@@ -93,10 +125,13 @@ async def main() -> None:
         listening_paused = False
         apple_transcriber: Optional[AppleSpeechTranscriber] = None
 
-        # early-commit-on-partials: keyed internally by Transcript.id (None for
-        # typed/panel input, which naturally opts out of all of this).
-        early_commit = EarlyCommitTracker()
-        first_partial_ts: dict[int, float] = {}
+        context = ConversationContext()
+        latest_raw: dict[int, str] = {}
+        action_busy = False
+        action_queue: list = []
+        action_wake = asyncio.Event()
+        buffered_transcript: Optional[Transcript] = None
+        silence_task: Optional[asyncio.Task] = None
 
         async def on_new_page(new_page) -> None:
             """Detects popups/new tabs the PAGE itself opened (target=_blank, window.open)
@@ -126,59 +161,95 @@ async def main() -> None:
             last_command_ts = time.time()
             await undo.push_checkpoint(checkpoints, active_page)
 
-        async def run_action(d: Decision, target_name: str = "") -> None:
+        async def run_action(d: Decision, target_name: str = "", turn: Optional[Turn] = None) -> None:
             nonlocal active_page, last_scroll
             await mark_user_command()
-
-            if d.intent in TAB_INTENTS:
-                try:
-                    if d.intent == "new_tab":
-                        active_page = await act.new_tab(ctx, d.text)
-                        print("  ✓ opened new tab", active_page.url)
-                    elif d.intent == "close_tab":
-                        active_page = await act.close_tab(ctx, active_page)
-                        print("  ✓ closed tab, now on", active_page.url)
-                    elif d.intent == "switch_tab":
-                        active_page = await act.switch_tab(ctx, active_page, d.text or "next")
-                        print("  ✓ switched tab ->", active_page.url)
-                    recent_actions.append(f"did {d.intent} {d.text or ''}".strip())
-                    del recent_actions[:-5]
-                    await vox.show_on(active_page)  # bring_to_front + persist current state on the NEW tab
-                    await vox.set_then_idle_after(active_page, "acting", vox.describe_action(d, target_name))
-                except Exception as e:
-                    print("  ✗", e)
-                    await vox.set_then_idle_after(
-                        active_page, "error", vox.describe_failure(d.intent.replace("_", " ")), delay=ERROR_REVERT_S)
-                return
-            if d.target_id:
-                await highlight(active_page, d.target_id)
             try:
-                result = await execute(active_page, d)
-                print("  ✓", result)
-                recent_actions.append(result)
-                del recent_actions[:-5]
-                if result.startswith("no match"):
-                    await vox.set_then_idle_after(
-                        active_page, "error", vox.describe_not_found(d.text or target_name), delay=ERROR_REVERT_S)
-                elif result.startswith("could not find") or result.startswith("skipped"):
+                page_before = {"url": active_page.url, "title": await active_page.title()}
+            except Exception:
+                page_before = {"url": active_page.url if active_page else "", "title": ""}
+            outcome = "done"
+
+            try:
+                if d.intent in TAB_INTENTS:
+                    try:
+                        if d.intent == "new_tab":
+                            active_page = await act.new_tab(ctx, d.text)
+                            print("  ✓ opened new tab", active_page.url)
+                        elif d.intent == "close_tab":
+                            active_page = await act.close_tab(ctx, active_page)
+                            print("  ✓ closed tab, now on", active_page.url)
+                        elif d.intent == "switch_tab":
+                            active_page = await act.switch_tab(ctx, active_page, d.text or "next")
+                            print("  ✓ switched tab ->", active_page.url)
+                        outcome = f"did {d.intent} {d.text or ''}".strip()
+                        await vox.show_on(active_page)
+                        await vox.set_then_idle_after(active_page, "acting", vox.describe_action(d, target_name))
+                    except Exception as e:
+                        outcome = "failed"
+                        print("  ✗", e)
+                        await vox.set_then_idle_after(
+                            active_page, "error", vox.describe_failure(d.intent.replace("_", " ")), delay=ERROR_REVERT_S)
+                    return
+
+                if d.target_id:
+                    await highlight(active_page, d.target_id)
+                try:
+                    result = await execute(active_page, d)
+                    print("  ✓", result)
+                    if result.startswith("no match"):
+                        outcome = "failed"
+                        await vox.set_then_idle_after(
+                            active_page, "error", vox.describe_not_found(d.text or target_name), delay=ERROR_REVERT_S)
+                    elif result.startswith("could not find") or result.startswith("skipped"):
+                        outcome = "failed"
+                        await vox.set_then_idle_after(
+                            active_page, "error", vox.describe_failure(d.intent.replace("_", " ")), delay=ERROR_REVERT_S)
+                    elif d.intent == "scroll":
+                        outcome = result
+                        if result.startswith("Already"):
+                            await vox.set_then_idle_after(active_page, "error", result, delay=ERROR_REVERT_S)
+                        else:
+                            await vox.set_then_idle_after(active_page, "acting", result)
+                        if d.scroll_to is None:
+                            last_scroll = d
+                    else:
+                        outcome = result
+                        await vox.set_then_idle_after(active_page, "acting", vox.describe_action(d, target_name))
+                except Exception:
+                    outcome = "failed"
+                    print("  ✗ action failed")
                     await vox.set_then_idle_after(
                         active_page, "error", vox.describe_failure(d.intent.replace("_", " ")), delay=ERROR_REVERT_S)
-                elif d.intent == "scroll":
-                    # executor.act.scroll()'s own result text knows whether it actually
-                    # moved, hit an edge, or reached an explicit top/bottom target --
-                    # describe_action() can only guess from the Decision alone.
-                    if result.startswith("Already"):
-                        await vox.set_then_idle_after(active_page, "error", result, delay=ERROR_REVERT_S)
-                    else:
-                        await vox.set_then_idle_after(active_page, "acting", result)
-                    if d.scroll_to is None:
-                        last_scroll = d
-                else:
-                    await vox.set_then_idle_after(active_page, "acting", vox.describe_action(d, target_name))
-            except Exception:
-                print("  ✗ action failed")
-                await vox.set_then_idle_after(
-                    active_page, "error", vox.describe_failure(d.intent.replace("_", " ")), delay=ERROR_REVERT_S)
+            finally:
+                if active_page and d.intent not in TAB_INTENTS and active_page.url != page_before["url"]:
+                    context.remember_page(page_before["url"], page_before["title"])
+                    if outcome != "failed":
+                        outcome = f"navigated to {_short_url(active_page.url)}"
+                context.finish(turn, outcome)
+
+        def submit_call(fn) -> None:
+            action_queue.append(fn)
+            action_wake.set()
+
+        def submit_action(d: Decision, target_name: str, turn: Optional[Turn] = None) -> None:
+            submit_call(lambda: run_action(d, target_name, turn))
+
+        async def action_worker() -> None:
+            nonlocal action_busy, buffered_transcript
+            while True:
+                await action_wake.wait()
+                action_wake.clear()
+                while action_queue:
+                    item = action_queue.pop(0)
+                    action_busy = True
+                    try:
+                        await item()
+                    finally:
+                        action_busy = False
+                if buffered_transcript is not None:
+                    t, buffered_transcript = buffered_transcript, None
+                    sched.submit(t, force=True)
 
         async def go_back_to(index: int) -> None:
             nonlocal active_page
@@ -227,26 +298,69 @@ async def main() -> None:
             await vox.set(active_page, "unsure", f"Did you mean: {options}")
             pending = {"kind": "undo_disambiguate", "candidates": candidates}
 
-        async def handle(t: Transcript) -> None:
-            nonlocal pending, active_page, listening_paused
-            t_start = time.perf_counter()
-            text_norm = t.text.strip().lower()
+        def schedule_silence(t: Transcript, raw_text: str, retry_in_ms: int, utterance_id: Optional[int]) -> None:
+            nonlocal silence_task
+            if utterance_id is None or t.is_final or t.silent_ms >= policy.SILENCE_COMPLETE_MS or retry_in_ms <= 0:
+                return
+            if silence_task and not silence_task.done():
+                silence_task.cancel()
 
-            if t.id is not None:
-                if early_commit.already_committed(t.id):
-                    # The action ran on an earlier partial; this final's text was still
-                    # echoed to the overlay by the input loop, so settle it back to idle
-                    # instead of leaving the panel pinned on "Listening…" forever.
+            async def fire() -> None:
+                nonlocal silence_task
+                try:
+                    await asyncio.sleep(retry_in_ms / 1000)
+                except asyncio.CancelledError:
+                    return
+                silence_task = None
+                if latest_raw.get(utterance_id) != raw_text:
+                    return
+                sched.submit(
+                    Transcript(
+                        text=raw_text, is_final=False, confidence=t.confidence,
+                        id=utterance_id, silent_ms=float(policy.SILENCE_COMPLETE_MS),
+                    ),
+                    force=True,
+                )
+
+            silence_task = asyncio.create_task(fire())
+
+        async def handle(t: Transcript) -> None:
+            nonlocal pending, listening_paused, buffered_transcript, silence_task
+            t_start = time.perf_counter()
+            if silence_task and not silence_task.done():
+                silence_task.cancel()
+                silence_task = None
+
+            physical_id = t.id
+            raw_text = t.text
+            sliced = False
+            if physical_id is not None:
+                current, virtual_id = context.slice(physical_id, raw_text)
+                if current is None:
                     if t.is_final and vox.current_state() == "listening":
                         await vox.set(active_page, "idle")
-                    return  # already acted on this utterance via early commit -- ignore
-                first_partial_ts.setdefault(t.id, t_start)
-                if t.is_final:
-                    # the partial-tracking part of this utterance's life is over either way
-                    early_commit.forget(t.id)
-                    first_partial_ts.pop(t.id, None)
+                    return
+                sliced = current != raw_text
+                if sliced:
+                    t = Transcript(
+                        text=current, is_final=t.is_final, confidence=t.confidence,
+                        id=virtual_id, silent_ms=t.silent_ms,
+                    )
 
-            await vox.set(active_page, "listening", t.text)
+            text_norm = t.text.strip().lower()
+            display = f"{context.active_prefix} · {t.text}" if sliced and context.active_prefix else t.text
+            await vox.set(active_page, "listening", display)
+
+            # Captured before the confirm branch below may clear `pending`, so the model
+            # still sees what the user was asked to confirm when they reply with something
+            # that isn't a plain yes/no.
+            pending_confirmation = None
+            if pending and pending["kind"] == "confirm":
+                pending_confirmation = vox.describe_action(pending["decision"], pending.get("target_name", ""))
+
+            def _executed_prefix(t: Transcript, d: Decision) -> str:
+                start = len(context.active_prefix or "") if context.consumed_id == physical_id else 0
+                return _consumed_prefix(raw_text, t.text, d.act_now, t.is_final, start)
 
             # UI-only meta-commands: deterministic, never go through Jev.
             if text_norm in PAUSE_LISTENING_PHRASES or (
@@ -279,31 +393,57 @@ async def main() -> None:
                 print("  ✓ showed Vox")
                 pending = None
                 return
+
             # explicit phrases skip inference entirely
             if text_norm in PREV_TAB_PHRASES:
-                await mark_user_command()
-                active_page = await act.switch_tab(ctx, active_page, "previous")
-                await vox.show_on(active_page)
-                await vox.set_then_idle_after(active_page, "acting", "Switching to the previous tab")
+                turn = context.commit(t.text, Decision(True, "switch_tab", text="previous"), "previous tab")
+                context.consume(physical_id, t.text)
+                submit_action(Decision(True, "switch_tab", text="previous"), "previous tab", turn)
                 pending = None
                 return
             if text_norm in PREV_PAGE_PHRASES:
-                await resolve_and_execute_undo(same_tab_only=True)
+                turn = context.commit(t.text, Decision(True, "back"), "previous page")
+                context.consume(physical_id, t.text)
+
+                async def undo_same_tab() -> None:
+                    try:
+                        await resolve_and_execute_undo(same_tab_only=True)
+                        context.finish(turn, "done")
+                    except Exception:
+                        context.finish(turn, "failed")
+
+                submit_call(undo_same_tab)
                 pending = None
                 return
             if text_norm in UNDO_PHRASES:
-                await resolve_and_execute_undo()
+                turn = context.commit(t.text, Decision(True, "back"), "undo")
+                context.consume(physical_id, t.text)
+
+                async def undo_last() -> None:
+                    try:
+                        await resolve_and_execute_undo()
+                        context.finish(turn, "done")
+                    except Exception:
+                        context.finish(turn, "failed")
+
+                submit_call(undo_last)
                 pending = None
                 return
             if spans.is_scroll_repeat(t.text):
                 repeat_decision = last_scroll or Decision(True, "scroll", scroll_amount=spans.DEFAULT_SCROLL_FRACTION)
-                await run_action(repeat_decision)
+                turn = context.commit(t.text, repeat_decision)
+                context.consume(physical_id, t.text)
+                submit_action(repeat_decision, "", turn)
                 pending = None
                 return
 
             if pending and pending["kind"] == "confirm":
                 if text_norm in AFFIRM:
-                    await run_action(pending["decision"], pending.get("target_name", ""))
+                    d = pending["decision"]
+                    said = pending.get("said", t.text)
+                    turn = context.commit(said, d, pending.get("target_name", ""))
+                    context.consume(pending.get("physical_id"), pending.get("prefix") or said)
+                    submit_action(d, pending.get("target_name", ""), turn)
                     pending = None
                     return
                 if text_norm in DENY:
@@ -320,8 +460,11 @@ async def main() -> None:
                     d = pending["decision"]
                     d.target_id = candidates[n - 1].id
                     d.ambiguous = False
+                    said = pending.get("said", t.text)
+                    turn = context.commit(said, d, candidates[n - 1].name)
+                    context.consume(pending.get("physical_id"), pending.get("prefix") or said)
                     pending = None
-                    await run_action(d, candidates[n - 1].name)
+                    submit_action(d, candidates[n - 1].name, turn)
                     return
                 pending = None  # fall through and treat this as a new command
 
@@ -329,10 +472,24 @@ async def main() -> None:
                 candidates = pending["candidates"]
                 n = _parse_ordinal_reply(t.text, len(candidates))
                 if n is not None:
+                    d = Decision(True, "back")
+                    turn = context.commit(t.text, d, "undo")
                     pending = None
-                    await go_back_to(candidates[n - 1])
+
+                    async def undo_choice() -> None:
+                        try:
+                            await go_back_to(candidates[n - 1])
+                            context.finish(turn, "done")
+                        except Exception:
+                            context.finish(turn, "failed")
+
+                    submit_call(undo_choice)
                     return
                 pending = None  # fall through and treat this as a new command
+
+            if action_busy or action_queue:
+                buffered_transcript = t
+                return
 
             # Only switch to "thinking" once the utterance is final, and keep its words
             # on screen -- doing this per partial made the panel strobe between
@@ -344,29 +501,29 @@ async def main() -> None:
             viewport = active_page.viewport_size
             vp = (viewport["width"], viewport["height"]) if viewport else None
             prompt_text = to_prompt_text(cands, vp)
+            page_info = {"url": state.url, "title": state.title, "site": _site_of(state.url)}
 
             decide_t0 = time.perf_counter()
-            d = await decide(t.text, t.is_final, prompt_text, cands, recent_actions)
+            d = await decide(
+                t.text, t.is_final, prompt_text, cands,
+                page=page_info, context=context,
+                pending_confirmation=pending_confirmation, silent_ms=t.silent_ms,
+            )
             decide_ms = (time.perf_counter() - decide_t0) * 1000
 
             target_name = _target_name(d, cands)
-
-            # EARLY COMMIT: act on a partial, before the ~700ms endpoint-triggered final,
-            # for intents with no free text to get wrong -- only once confidence is high
-            # AND the same target has held steady across 2 consecutive partials.
-            if early_commit.should_commit(t.id, d, t.is_final):
-                latency_ms = (t_start - first_partial_ts.pop(t.id, t_start)) * 1000
-                logger.info(
-                    "early commit: id=%s intent=%s target=%s first_partial_to_action_ms=%.0f",
-                    t.id, d.intent, d.target_id, latency_ms,
-                )
-                await run_action(d, target_name)
+            stale = False
+            if physical_id is not None:
+                latest = latest_raw.get(physical_id)
+                stale = latest is not None and " ".join(latest.split()) != " ".join(raw_text.split())
+            if physical_id is not None and context.was_consumed(physical_id, t.text):
                 return
 
-            outcome = policy.decide_outcome(d, t.is_final)
+            result = policy.evaluate(d, t.is_final, silent_ms=t.silent_ms, stale=stale)
+            outcome = result.outcome
             logger.info(
-                "transcript=%r final=%s -> %s intent=%s target=%s conf=%.2f decide_ms=%.0f total_ms=%.0f",
-                t.text, t.is_final, outcome, d.intent, d.target_id, d.confidence,
+                "transcript=%r final=%s stale=%s -> %s intent=%s target=%s conf=%.2f decide_ms=%.0f total_ms=%.0f",
+                t.text, t.is_final, stale, outcome, d.intent, d.target_id, d.confidence,
                 decide_ms, (time.perf_counter() - t_start) * 1000,
             )
 
@@ -375,7 +532,11 @@ async def main() -> None:
                     await vox.set(active_page, "idle")
                 return
             if outcome == "WAIT":
-                return  # still Listening/Thinking from above; nothing new to show yet
+                if t.is_final:
+                    await vox.set(active_page, "idle")
+                else:
+                    schedule_silence(t, raw_text, result.retry_in_ms, physical_id)
+                return
             if outcome == "PREVIEW":
                 if d.target_id:
                     await highlight(active_page, d.target_id)
@@ -385,19 +546,35 @@ async def main() -> None:
                     await highlight(active_page, d.target_id)
                 print(f'  ⚠ "{target_name}" looks irreversible -- say "yes" to confirm or "no" to cancel.')
                 await vox.set(active_page, "unsure", f"{target_name}? Say yes or no")
-                pending = {"kind": "confirm", "decision": d, "target_name": target_name}
+                pending = {
+                    "kind": "confirm", "decision": d, "target_name": target_name,
+                    "said": t.text, "physical_id": physical_id,
+                    "prefix": _executed_prefix(t, d),
+                }
                 return
             if outcome == "DISAMBIGUATE":
                 top = cands[:3]
+                if not top:
+                    print("  ✗ no matching element on this page")
+                    await vox.set_then_idle_after(
+                        active_page, "error", vox.describe_not_found(t.text), delay=ERROR_REVERT_S)
+                    return
                 print("  ❓ Which one did you mean?")
                 for i, e in enumerate(top, 1):
                     print(f'     {i}) {e.role} "{e.name}"')
                 options = "   ".join(f"{i} · {e.name}" for i, e in enumerate(top, 1))
                 await vox.set(active_page, "unsure", f"Did you mean: {options}")
-                pending = {"kind": "disambiguate", "decision": d, "candidates": top}
+                pending = {
+                    "kind": "disambiguate", "decision": d, "candidates": top,
+                    "said": t.text, "physical_id": physical_id,
+                    "prefix": _executed_prefix(t, d),
+                }
                 return
             if outcome == "COMMIT":
-                await run_action(d, target_name)
+                pending = None  # a fresh command supersedes any confirmation still open
+                turn = context.commit(t.text, d, target_name)
+                context.consume(physical_id, _executed_prefix(t, d))
+                submit_action(d, target_name, turn)
 
         sched = Scheduler(handle)
 
@@ -430,7 +607,7 @@ async def main() -> None:
             async for t in TypedTranscriber().stream():
                 input_queue.put_nowait(t)
 
-        tasks = [asyncio.create_task(feed_terminal())]
+        tasks = [asyncio.create_task(feed_terminal()), asyncio.create_task(action_worker())]
 
         # VB_TRANSCRIBER=apple|typed selects the mic transcriber; defaults to apple if
         # the Swift listener binary has been built, else falls back to typed-only. The
@@ -464,14 +641,13 @@ async def main() -> None:
         try:
             while True:
                 t = await input_queue.get()
-                # Echo mic partials to the overlay immediately, outside the decision
-                # pipeline: Scheduler cancels the previous in-flight handler on every
-                # new partial, so a cancelled handle() never reached vox.set() and the
-                # live transcript would visibly lag/stall exactly when speech is fastest.
-                # Finals still render in handle(), and typed input (id=None) keeps its
-                # optimistic display from the overlay itself.
-                if t.id is not None and not t.is_final:
-                    await vox.set(active_page, "listening", t.text)
+                # Echo mic partials immediately, outside the decision pipeline: a
+                # cancelled stale decision never reaches vox.set(), so the live
+                # transcript would otherwise lag exactly when speech is fastest.
+                if t.id is not None:
+                    latest_raw[t.id] = t.text
+                    if not t.is_final:
+                        await vox.set(active_page, "listening", t.text)
                 sched.submit(t)
         finally:
             for task in tasks:
