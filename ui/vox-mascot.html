@@ -18,14 +18,14 @@
   .stage { display: flex; flex-direction: column; align-items: center; gap: 28px; }
 
   /* ---------- the mascot ---------- */
-  .vox { width: 180px; height: 180px; position: relative; }
-  .vox svg { width: 100%; height: 100%; overflow: visible; }
+  .vox { width: 180px; height: 180px; position: relative; margin: 8px; }
+  .vox svg { width: 100%; height: 100%; overflow: hidden; } /* nothing can spill out and get clipped by the screen edge */
   .vox .body-g { transform-origin: 100px 110px; animation: bob 3.2s ease-in-out infinite; }
   .vox .eyes  { transform-origin: 100px 100px; transition: transform .25s ease; }
   .vox .eye   { transform-box: fill-box; transform-origin: center; transition: transform .2s ease; }
   .vox .lid   { transform-box: fill-box; transform-origin: center; transform: scaleY(0); }
   .vox .happy, .vox .brow, .vox .q, .vox .sweat, .vox .worry { opacity: 0; transition: opacity .2s; }
-  .vox .ring  { opacity: 0; transform-origin: 100px 100px; }
+  .vox .ring  { opacity: 0; }
 
   /* idle: bob + blink */
   .vox.idle .eye { animation: blink 4s infinite; }
@@ -63,7 +63,7 @@
   @keyframes flinch { 0%,100% { transform: translateX(0) rotate(0) } 20% { transform: translateX(-6px) rotate(-5deg) } 45% { transform: translateX(5px) rotate(4deg) } 70% { transform: translateX(-2px) rotate(-1deg) } }
   @keyframes drip   { 0% { opacity: 0; transform: translateY(-4px) scale(.6) } 15% { opacity: 1; transform: translateY(0) scale(1) } 75% { opacity: 1; transform: translateY(26px) scale(1,1.15) } 100% { opacity: 0; transform: translateY(34px) scale(.8,1.2) } }
   @keyframes wobble { 0%,100% { transform: rotate(0) } 25% { transform: rotate(-6deg) } 75% { transform: rotate(6deg) } }
-  @keyframes ring   { from { transform: scale(.85); opacity: .7 } to { transform: scale(1.35); opacity: 0 } }
+  @keyframes ring   { 0%,100% { opacity: .35; stroke-width: 3 } 50% { opacity: 1; stroke-width: 6 } }
 
   @media (prefers-reduced-motion: reduce) {
     .vox * { animation: none !important; }
@@ -71,48 +71,21 @@
 
   /* ---------- frosted transcript panel ---------- */
   .panel {
-    width: min(460px, 90vw); padding: 14px 18px; border-radius: 18px;
-    /* Liquid-glass: clear edges, frosted only behind the text, specular rim */
-    background: linear-gradient(160deg, rgba(255,255,255,.16), rgba(255,255,255,.03));
-    backdrop-filter: saturate(150%) brightness(1.06); -webkit-backdrop-filter: saturate(150%) brightness(1.06);
-    border: 1px solid rgba(255,255,255,.55);
-    box-shadow:
-      0 10px 30px rgba(0,30,60,.22),
-      inset 1.5px 1.5px 0 rgba(255,255,255,.95),
-      inset -1px -1px 0 rgba(255,255,255,.35),
-      inset 0 0 18px rgba(255,255,255,.18);
-    isolation: isolate;
-    text-shadow: 0 0 8px #fff, 0 0 4px #fff, 0 0 2px #fff;
-    position: relative;
+    width: min(460px, 90vw); padding: 14px 18px; border-radius: 18px; position: relative; overflow: hidden;
+    /* Frutiger Aero frosted glass: light aqua tint, a little see-through */
+    background: linear-gradient(180deg, rgba(255,255,255,.80) 0%, rgba(232,248,255,.72) 55%, rgba(214,244,236,.70) 100%);
+    backdrop-filter: blur(16px) saturate(160%); -webkit-backdrop-filter: blur(16px) saturate(160%);
+    border: 1px solid rgba(255,255,255,.95);
+    box-shadow: 0 10px 28px rgba(10,60,110,.22), 0 0 0 1px rgba(120,190,230,.35), inset 0 1px 0 #fff;
   }
-  .panel::before {           /* frost layer that fades out toward the edges */
-    content: ""; position: absolute; inset: 0; border-radius: inherit; z-index: -1;
-    background: rgba(255,255,255,.30);
-    backdrop-filter: blur(18px) saturate(170%); -webkit-backdrop-filter: blur(18px) saturate(170%);
-    -webkit-mask: radial-gradient(ellipse 75% 85% at 45% 55%, #000 60%, transparent 100%);
-            mask: radial-gradient(ellipse 75% 85% at 45% 55%, #000 60%, transparent 100%);
+  .panel::after {            /* glossy top half, classic Aero */
+    content: ""; position: absolute; left: 0; right: 0; top: 0; height: 48%; pointer-events: none;
+    background: linear-gradient(180deg, rgba(255,255,255,.75), rgba(255,255,255,.12));
+    border-radius: 18px 18px 50% 50% / 18px 18px 14px 14px;
   }
-  .panel::after {            /* glossy streak along the top edge */
-    content: ""; position: absolute; left: 12px; right: 12px; top: 2px; height: 40%;
-    border-radius: 14px 14px 40% 40%; pointer-events: none;
-    background: linear-gradient(180deg, rgba(255,255,255,.35), rgba(255,255,255,0));
-  }
-  /* status chip: solid colour + white text, readable on any background */
-  .panel .label {
-    display: inline-block; padding: 3px 10px 3px 9px; border-radius: 999px;
-    font-size: 13px; font-weight: 800; letter-spacing: .05em; text-transform: uppercase;
-    color: #fff; text-shadow: none; background: #4b5563;
-    box-shadow: 0 1px 3px rgba(0,0,0,.25), inset 0 1px 0 rgba(255,255,255,.35);
-  }
-  .panel .label::before { content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 50%;
-    background: #fff; margin-right: 6px; vertical-align: 1px; opacity: .9; }
-  .stage[data-state="listening"] .panel .label { background: #0f7a45; }
-  .stage[data-state="listening"] .panel .label::before { animation: dot 1s ease-in-out infinite; }
-  .stage[data-state="thinking"]  .panel .label { background: #0b5f99; }
-  .stage[data-state="acting"]    .panel .label { background: #0f7a45; }
-  .stage[data-state="unsure"]    .panel .label { background: #6b3fb3; }
-  .stage[data-state="error"]     .panel .label { background: #b45309; }
-  @keyframes dot { 50% { opacity: .3 } }
+  .panel > * { position: relative; z-index: 1; }
+  .panel .label { font-size: 13px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: #0d4f7a; }
+  .stage[data-state="error"] .panel .label { color: #9a4a00; }
   .panel .hide { position: absolute; top: 8px; right: 10px; width: 26px; height: 26px; border-radius: 50%;
     border: 1px solid rgba(255,255,255,.7); background: rgba(255,255,255,.4); color: #0b2540;
     font-size: 16px; line-height: 1; cursor: pointer; }
@@ -120,7 +93,7 @@
   .stage.min .panel { display: none; }
   .stage.min .vox { width: 64px; height: 64px; cursor: pointer; }
   .stage.min .vox .q, .stage.min .vox .ring { display: none; }
-  .panel .text  { font-size: 20px; font-weight: 600; margin-top: 8px; color: #06182b; min-height: 1.4em; }
+  .panel .text  { font-size: 20px; font-weight: 600; text-shadow: 0 1px 0 rgba(255,255,255,.8); margin-top: 4px; color: #06182b; min-height: 1.4em; }
 
   .stage[data-state="error"] .panel { border-color: rgba(245,158,11,.85); box-shadow: 0 10px 30px rgba(0,30,60,.25), 0 0 0 3px rgba(245,158,11,.25), inset 0 1px 0 rgba(255,255,255,.9); }
   .controls { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
@@ -164,7 +137,7 @@
       </defs>
 
       <ellipse cx="100" cy="184" rx="52" ry="9" fill="url(#vx-shadow)"/>
-      <circle class="ring" cx="100" cy="100" r="80" fill="none" stroke="url(#vx-ring)" stroke-width="5"/>
+      <circle class="ring" cx="100" cy="108" r="84" fill="none" stroke="url(#vx-ring)" stroke-width="5"/>
 
       <g class="body-g">
         <!-- droplet body -->
@@ -228,9 +201,11 @@
     error:     ["Oops",         "I couldn't find \"book appointment\" on this page. Try saying it differently?"],
   };
   const vox = document.getElementById("vox");
+  let current = "idle";
   let micTimer = null;
 
   function setVoxState(state, text) {
+    current = state;
     vox.className = "vox " + state;
     document.querySelector(".stage").dataset.state = state;
     vox.setAttribute("aria-label", "Vox assistant: " + state);
@@ -253,8 +228,12 @@
     controls.appendChild(b);
   }
   const stage = document.querySelector(".stage");
-  document.getElementById("hide").onclick = () => stage.classList.add("min");
-  vox.onclick = () => stage.classList.remove("min");
+  function minimize() { stage.classList.add("min"); }
+  function restore()  { stage.classList.remove("min"); const t = document.getElementById("text").textContent;
+                        vox.className = "vox"; void vox.offsetWidth; setVoxState(current, t); } // restart animations
+  window.voxMinimize = minimize; window.voxRestore = restore;
+  document.getElementById("hide").onclick = minimize;
+  vox.onclick = () => { if (stage.classList.contains("min")) restore(); };
   setVoxState("idle");
 </script>
 </body>

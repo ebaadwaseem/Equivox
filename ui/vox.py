@@ -20,12 +20,30 @@ logger = logging.getLogger("vox")
 
 OVERLAY_JS = (Path(__file__).parent / "overlay.js").read_text()
 
-_HIDE_RE = re.compile(r"^(hide|minimize|minimise)\s+vox$", re.I)
-_SHOW_RE = re.compile(r"^(show|restore|unhide|maximize|maximise)\s+vox$", re.I)
+# deterministic, no Jev -- these are UI-only meta-commands about Vox itself, not
+# browser actions, so they're intercepted before the transcript ever reaches decide().
+_MINIMIZE_PHRASES = [
+    "minimize", "minimize yourself", "vox minimize", "hide", "hide vox", "hide yourself",
+    "go away", "go small", "get out of the way", "shrink",
+]
+_SHOW_PHRASES = [
+    "show vox", "show yourself", "come back", "vox come back", "expand", "restore",
+    "vox", "where are you",
+]
+
+
+def _build_vox_command_re(phrases: list[str]) -> re.Pattern:
+    # optional "vox"/"hey vox" prefix and optional "please" (leading or trailing)
+    alts = "|".join(re.escape(p) for p in sorted(phrases, key=len, reverse=True))
+    return re.compile(rf"^(?:please\s+)?(?:hey\s+vox\s+|vox\s+)?(?:{alts})(?:\s+please)?$", re.I)
+
+
+_MINIMIZE_RE = _build_vox_command_re(_MINIMIZE_PHRASES)
+_SHOW_RE = _build_vox_command_re(_SHOW_PHRASES)
 
 
 def is_hide_command(text: str) -> bool:
-    return bool(_HIDE_RE.match(text.strip()))
+    return bool(_MINIMIZE_RE.match(text.strip()))
 
 
 def is_show_command(text: str) -> bool:
