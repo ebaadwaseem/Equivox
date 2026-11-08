@@ -34,7 +34,9 @@ async def main() -> None:
         async def handle(t: Transcript) -> None:
             state = await get_page_state(page)
             cands = shortlist(state, t.text)
-            d = await decide(t.text, to_prompt_text(cands), cands)
+            viewport = page.viewport_size
+            vp = (viewport["width"], viewport["height"]) if viewport else None
+            d = await decide(t.text, to_prompt_text(cands, vp), cands)
             print(f"  → {d}")
             if not (d.is_command and d.complete and t.is_final):
                 return  # partial: later this is where PREVIEW (highlight only) goes

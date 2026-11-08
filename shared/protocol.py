@@ -22,6 +22,13 @@ class Element:
     w: int = 0
     h: int = 0
     in_viewport: bool = True
+    # optional extra state (added by Person 2, all default so old code/tests still work)
+    input_type: Optional[str] = None   # input[type] / "textarea" / "select"
+    value: Optional[str] = None        # current text value / selected option label
+    checked: Optional[bool] = None     # checkbox/radio state
+    href_domain: Optional[str] = None  # short domain for links, e.g. "example.com"
+    active: bool = False               # True if this is document.activeElement
+    options: list[str] = field(default_factory=list)  # <select> option labels, for matching e.g. "select tuesday"
 
 
 @dataclass
