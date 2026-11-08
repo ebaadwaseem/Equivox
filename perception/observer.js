@@ -132,6 +132,9 @@
   }
 
   const accepted = []; // [{el, rect, data}]
+  const hrefSeen = new Set(); // same-destination SIBLING links (not nested) also collapse to one:
+                               // search-result tiles commonly wrap the title, a thumbnail, the
+                               // URL text, and the snippet in separate <a> tags to the same href.
 
   for (const el of document.querySelectorAll(SELECTOR)) {
     const r = el.getBoundingClientRect();
@@ -144,6 +147,11 @@
     const type = tag === 'input' ? (el.getAttribute('type') || 'text').toLowerCase() : null;
     const role = roleOf(el, tag);
     const rect = { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) };
+
+    if (role === 'link' && el.href) {
+      if (hrefSeen.has(el.href)) continue; // keep the first sibling (usually the title link)
+      hrefSeen.add(el.href);
+    }
 
     // dedupe nested duplicates (e.g. <a><button>Same</button></a>): same-ish box, ancestor/descendant
     let dupIndex = -1;
@@ -183,6 +191,13 @@
       href_domain: role === 'link' ? hrefDomain(el) : null,
       active: el === document.activeElement,
       options: tag === 'select' ? Array.from(el.options).slice(0, 20).map((o) => clean(o.text)) : [],
+      // semantic landmarks catch well-built pages; the class/id patterns catch the common
+      // case of a plain <div class="header">/"navbar" with no real HTML5 semantics (e.g. DDG)
+      in_chrome: !!el.closest(
+        'header, nav, footer, [role="navigation"], [role="banner"], [role="contentinfo"], ' +
+        '[class*="header" i], [class*="navbar" i], [class*="masthead" i], [class*="footer" i], ' +
+        '[id*="header" i], [id*="navbar" i], [id*="footer" i]'
+      ),
     };
   }
 

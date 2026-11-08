@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Mock Search Results</title>
+<style>
+  body { font-family: sans-serif; margin: 0; }
+  .header { display: flex; gap: 16px; padding: 12px 20px; background: #222; }
+  .header a { color: white; text-decoration: none; }
+  .result { margin: 24px; }
+  .footer { padding: 12px 20px; background: #eee; }
+</style>
+</head>
+<body>
+<!-- plain <div class="header">, no semantic <header> tag -- mirrors real sites like DuckDuckGo's html.duckduckgo.com -->
+<div class="header">
+  <a href="https://example.com/" class="logo">ExampleSearch</a>
+  <a href="https://example.com/settings">Settings</a>
+</div>
+
+<main>
+  <!-- each "result" wraps the SAME href in multiple sibling <a> tags: title, icon, url-text --
+       mirrors DuckDuckGo's result__a / icon / result__url / result__snippet pattern -->
+  <div class="result">
+    <a href="https://clinic-a.example.com/" class="result-title">Clinic A - Physiotherapy</a>
+    <a href="https://clinic-a.example.com/" class="result-icon"></a>
+    <a href="https://clinic-a.example.com/" class="result-url">clinic-a.example.com</a>
+  </div>
+  <div class="result">
+    <a href="https://clinic-b.example.com/" class="result-title">Clinic B - Sports Medicine</a>
+    <a href="https://clinic-b.example.com/" class="result-icon"></a>
+    <a href="https://clinic-b.example.com/" class="result-url">clinic-b.example.com</a>
+  </div>
+  <div class="result">
+    <a href="https://clinic-c.example.com/" class="result-title">Clinic C - Rehab Center</a>
+    <a href="https://clinic-c.example.com/" class="result-icon"></a>
+    <a href="https://clinic-c.example.com/" class="result-url">clinic-c.example.com</a>
+  </div>
+</main>
+
+<div class="footer">
+  <a href="https://example.com/privacy">Privacy</a>
+</div>
+</body>
+</html>

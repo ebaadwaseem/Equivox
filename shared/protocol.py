@@ -29,6 +29,7 @@ class Element:
     href_domain: Optional[str] = None  # short domain for links, e.g. "example.com"
     active: bool = False               # True if this is document.activeElement
     options: list[str] = field(default_factory=list)  # <select> option labels, for matching e.g. "select tuesday"
+    in_chrome: bool = False  # inside <header>/<nav>/<footer> -- excluded when counting "results"
 
 
 @dataclass

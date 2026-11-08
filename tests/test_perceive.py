@@ -6,10 +6,11 @@ from pathlib import Path
 import pytest
 from playwright.async_api import async_playwright
 
-from perception.perceive import build_choice_criteria, get_page_state, shortlist, to_prompt_text
+from perception.perceive import build_choice_criteria, find_deterministic_target, get_page_state, shortlist, to_prompt_text
 from shared.protocol import Element, PageState
 
 FORM_FIXTURE = (Path(__file__).parent / "fixtures" / "pages" / "form.html").resolve().as_uri()
+RESULTS_FIXTURE = (Path(__file__).parent / "fixtures" / "pages" / "results.html").resolve().as_uri()
 
 
 def make_state(*elements: Element) -> PageState:
@@ -199,3 +200,72 @@ def test_observer_finds_the_delete_account_button(form_state):
     delete_btn = next((e for e in form_state.elements if e.name == "Delete account"), None)
     assert delete_btn is not None
     assert delete_btn.role == "button"
+
+
+# ---- observer.js extraction against a mock search-results page ----------
+# Mirrors a real bug found on duckduckgo.com/html/: each result wraps the SAME href in
+# several sibling <a> tags (title/icon/url-text), and the site "header" is a plain
+# <div class="header"> with no semantic HTML -- not a <header> tag or ARIA landmark.
+
+async def _load_results_state() -> PageState:
+    async with async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page()
+        await page.goto(RESULTS_FIXTURE)
+        state = await get_page_state(page)
+        await browser.close()
+        return state
+
+
+@pytest.fixture(scope="module")
+def results_state() -> PageState:
+    return asyncio.run(_load_results_state())
+
+
+def test_observer_collapses_same_href_sibling_links_to_one(results_state):
+    clinic_a_links = [e for e in results_state.elements if e.role == "link" and "clinic-a" in (e.name or "")]
+    # the title link should survive; the icon (empty name) and url-text siblings should not
+    # produce separate candidates for the same destination
+    same_dest = [e for e in results_state.elements if e.role == "link"]
+    hrefs_seen = [e.name for e in same_dest if "Clinic A" in e.name]
+    assert len(hrefs_seen) == 1
+
+
+def test_observer_only_one_link_per_result(results_state):
+    titles = [e.name for e in results_state.elements if e.role == "link" and "Clinic" in e.name]
+    assert titles == ["Clinic A - Physiotherapy", "Clinic B - Sports Medicine", "Clinic C - Rehab Center"]
+
+
+def test_observer_flags_div_based_header_as_chrome(results_state):
+    logo = next(e for e in results_state.elements if e.name == "ExampleSearch")
+    assert logo.in_chrome is True
+
+
+def test_observer_flags_div_based_footer_as_chrome(results_state):
+    privacy = next(e for e in results_state.elements if e.name == "Privacy")
+    assert privacy.in_chrome is True
+
+
+def test_observer_result_links_are_not_chrome(results_state):
+    clinic_a = next(e for e in results_state.elements if e.name == "Clinic A - Physiotherapy")
+    assert clinic_a.in_chrome is False
+
+
+def test_ordinal_result_excludes_header_chrome_link(results_state):
+    # "first result" must not resolve to the header logo link, even though it's
+    # technically the first <a> on the page
+    first = find_deterministic_target(results_state.elements, "open the first result")
+    assert first.name == "Clinic A - Physiotherapy"
+
+
+def test_ordinal_result_second_and_third(results_state):
+    second = find_deterministic_target(results_state.elements, "open the second result")
+    third = find_deterministic_target(results_state.elements, "open the third result")
+    assert second.name == "Clinic B - Sports Medicine"
+    assert third.name == "Clinic C - Rehab Center"
+
+
+def test_ordinal_plain_link_still_counts_header_links(results_state):
+    # "second link" (no "result" word) should NOT apply the chrome filter -- it's generic
+    first_link = find_deterministic_target(results_state.elements, "click the first link")
+    assert first_link.name == "ExampleSearch"
