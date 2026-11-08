@@ -88,6 +88,20 @@ def _find_role_filter(transcript: str) -> Optional[set[str]]:
     return next((ROLE_WORDS[w] for w in words if w in ROLE_WORDS), None)
 
 
+def _id_num(elem_id: str) -> int:
+    m = re.search(r"(\d+)$", elem_id)
+    return int(m.group(1)) if m else 0
+
+
+def _dom_order(elements: list[Element]) -> list[Element]:
+    """observer.js assigns ids sequentially in DOM order, so sorting by id number
+    recovers true page order even if the caller passed an already-reordered/shortlisted
+    list -- ordinals and "next field" are positional and need real page order, not
+    whatever order a lexical-relevance sort happened to produce.
+    """
+    return sorted(elements, key=lambda e: _id_num(e.id))
+
+
 def _find_ordinal_target(elements: list[Element], transcript: str) -> Optional[Element]:
     """"second link", "third result", "last field" -> the Nth element of that role."""
     words = [w.strip(".,!?") for w in transcript.lower().split()]
@@ -95,7 +109,7 @@ def _find_ordinal_target(elements: list[Element], transcript: str) -> Optional[E
     if ordinal_n is None:
         return None
     roles = _find_role_filter(transcript)
-    candidates = [e for e in elements if roles is None or e.role in roles]
+    candidates = [e for e in _dom_order(elements) if roles is None or e.role in roles]
     if not candidates:
         return None
     if ordinal_n == -1:
@@ -114,16 +128,26 @@ def _find_next_field(elements: list[Element], transcript: str) -> Optional[Eleme
     t = transcript.lower()
     if not any(p in t for p in _NEXT_FIELD_PHRASES):
         return None
-    fields = [(i, e) for i, e in enumerate(elements) if e.role in _FIELD_ROLES]
+    ordered = _dom_order(elements)
+    fields = [(i, e) for i, e in enumerate(ordered) if e.role in _FIELD_ROLES]
     if not fields:
         return None
-    active_idx = next((i for i, e in enumerate(elements) if e.active), None)
+    active_idx = next((i for i, e in enumerate(ordered) if e.active), None)
     if active_idx is None:
         return fields[0][1]
     for i, e in fields:
         if i > active_idx:
             return e
     return fields[0][1]  # wrap around
+
+
+def find_deterministic_target(elements: list[Element], transcript: str) -> Optional[Element]:
+    """Ordinal ("second link") or "next field" matches: these are positional/structural,
+    not semantic, so backend/model.py should trust this over the model's own target
+    guess -- a flat choice list gives an LLM no way to know an element is "the second
+    link" versus any other link.
+    """
+    return _find_ordinal_target(elements, transcript) or _find_next_field(elements, transcript)
 
 
 def _lexical_score(e: Element, words: set[str]) -> int:

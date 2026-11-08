@@ -14,6 +14,8 @@ async def execute(page: Page, d: Decision) -> str:
             await page.locator(sel).first.click(timeout=3000)
         case "type" if sel:
             await page.locator(sel).first.fill(d.text or "", timeout=3000)
+        case "select" if sel:
+            await page.locator(sel).first.select_option(label=d.text or "", timeout=3000)
         case "scroll":
             await page.mouse.wheel(0, d.scroll_amount or 600)
         case "back":
@@ -24,7 +26,9 @@ async def execute(page: Page, d: Decision) -> str:
             url = d.text if d.text.startswith("http") else f"https://{d.text}"
             await page.goto(url)
         case "search" if d.text:
-            await page.goto(f"https://duckduckgo.com/?q={quote_plus(d.text)}")
+            # the plain duckduckgo.com/?q= form doesn't render results without JS; the
+            # static /html/ endpoint does and is faster to load.
+            await page.goto(f"https://duckduckgo.com/html/?q={quote_plus(d.text)}")
         case _:
             return f"skipped ({d.intent}, target={d.target_id})"
     return f"did {d.intent} {d.target_id or d.text or ''}".strip()

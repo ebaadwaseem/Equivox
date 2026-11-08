@@ -40,7 +40,9 @@ class PageState:
 
 
 # ---- Person 3 (backend/model) produces these ----
-Intent = Literal["click", "type", "scroll", "navigate", "back", "forward", "search", "none"]
+# "select" added for <select> dropdowns (e.g. "select Tuesday") -- clicking one open headlessly
+# isn't reliable, it needs Playwright's select_option(), so it gets its own intent.
+Intent = Literal["click", "type", "select", "scroll", "navigate", "back", "forward", "search", "none"]
 
 
 @dataclass
@@ -48,7 +50,11 @@ class Decision:
     is_command: bool
     intent: Intent
     target_id: Optional[str] = None   # Element.id
-    text: Optional[str] = None        # text to type / search query / url
+    text: Optional[str] = None        # text to type / search query / url / option label
     scroll_amount: int = 0            # pixels, negative = up
     complete: bool = True             # is the command finished being spoken?
     confidence: float = 1.0
+    # optional extras (added by Person 3, all default so old code/tests still work)
+    destructive: bool = False         # irreversible-looking action (delete, submit) -> ask to confirm
+    ambiguous: bool = False           # top-2 target candidates are too close to call automatically
+    target_confidence: float = 1.0    # how sure the model is about target_id specifically
