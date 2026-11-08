@@ -1,177 +1,107 @@
+
+"""Single-line live subtitles. Run transcribe.py to start recognition."""
 import queue
 import threading
 import tkinter as tk
-from tkinter import ttk
 from tkinter import font as tkfont
+from tkinter import ttk
 
 
 class LiveSubtitle:
-    """Create and run on the main thread."""
+    """Create on the main thread; recognition updates are thread-safe."""
 
     def __init__(self, max_chars=20000):
         self._queue = queue.Queue()
-        self._closed = threading.Event()
+        self.closed = threading.Event()
         self._max_chars = max(1, int(max_chars))
-
+        self._history = ''
+        self._partial = ''
         self.root = tk.Tk()
-        self.root.title("Live Subtitles")
-        self.root.geometry("800x150")
+        self.root.title('Live Subtitles')
+        self.root.geometry('800x150')
         self.root.minsize(320, 120)
-        self.root.attributes("-topmost", True)
-
+        self.root.attributes('-topmost', True)
         toolbar = ttk.Frame(self.root, padding=6)
-        toolbar.pack(fill="x")
-
-        self._on_top = tk.BooleanVar(
-            master=self.root,
-            value=True,
-        )
-
-        ttk.Checkbutton(
-            toolbar,
-            text="Always on Top",
-            variable=self._on_top,
-            command=self._toggle_topmost,
-        ).pack(side="left")
-
-        ttk.Button(
-            toolbar,
-            text="Clear",
-            command=self.clear,
-        ).pack(side="right")
-
-        self._font = tkfont.nametofont(
-            "TkDefaultFont", root=self.root
-        ).copy()
+        toolbar.pack(fill='x')
+        self._on_top = tk.BooleanVar(master=self.root, value=True)
+        ttk.Checkbutton(toolbar, text='Always on Top', variable=self._on_top,
+                        command=lambda: self.root.attributes('-topmost', self._on_top.get())).pack(side='left')
+        ttk.Button(toolbar, text='Clear', command=self.clear).pack(side='right')
+        self._font = tkfont.nametofont('TkDefaultFont', root=self.root).copy()
         self._font.configure(size=24)
-
-        self.text = tk.Text(
-            self.root,
-            height=1,
-            wrap="none",
-            font=self._font,
-            bg="#171717",
-            fg="white",
-            padx=12,
-            pady=12,
-            relief="flat",
-            highlightthickness=0,
-            state="disabled",
-        )
-        self.text.pack(
-            fill="both",
-            expand=True,
-            padx=6,
-            pady=(0, 6),
-        )
-
-        self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self.text = tk.Text(self.root, height=1, wrap='none', font=self._font,
+                            bg='#171717', fg='white', padx=12, pady=12,
+                            relief='flat', highlightthickness=0, state='disabled')
+        self.text.pack(fill='both', expand=True, padx=6, pady=(0, 6))
+        self._status = tk.StringVar(master=self.root, value='Starting recognition...')
+        ttk.Label(self.root, textvariable=self._status).pack(fill='x', padx=6)
+        self.root.protocol('WM_DELETE_WINDOW', self.close)
         self._timer = self.root.after(30, self._drain)
+        self.text.bind('<Configure>', lambda event: self.text.xview_moveto(1.0))
 
-    def _toggle_topmost(self):
-        self.root.attributes("-topmost", self._on_top.get())
+    def _send(self, kind, text):
+        if not self.closed.is_set():
+            self._queue.put((kind, ' '.join(str(text).split())))
 
-    def append_text(self, text):
-        """Append new text. Safe to call from a worker thread.
+    def partial(self, text):
+        """Replace the current hypothesis, including with an empty result."""
+        self._send('partial', text)
 
-        Pass only newly recognized text, not the full transcript.
-        Include spaces between English words as needed.
-        """
-        if text is None or self._closed.is_set():
-            return
+    def final(self, text):
+        """Commit one result and remove its temporary hypothesis."""
+        self._send('final', text)
 
-        # Keep the subtitles on a single line.
-        text = str(text).replace("\r", " ").replace("\n", " ")
+    def status(self, text):
+        self._send('status', text)
 
-        if text:
-            self._queue.put(text)
-
-    def add_sentence(self, sentence):
-        """Append a completed sentence followed by a space."""
-        if sentence is None:
-            return
-
-        sentence = " ".join(str(sentence).split())
-        if sentence:
-            self.append_text(sentence + " ")
+    def _render(self):
+        self._history = self._history[-self._max_chars:]
+        value = (self._history + self._partial)[-self._max_chars:]
+        self.text.configure(state='normal')
+        self.text.delete('1.0', 'end')
+        self.text.insert('1.0', value)
+        self.text.configure(state='disabled')
+        self.text.xview_moveto(1.0)
 
     def _drain(self):
-        """Apply queued updates on the Tk main thread."""
-        parts = []
-
+        changed = False
         for _ in range(200):
             try:
-                parts.append(self._queue.get_nowait())
+                kind, text = self._queue.get_nowait()
             except queue.Empty:
                 break
-
-        if parts:
-            self.text.configure(state="normal")
-            self.text.insert("end", "".join(parts))
-
-            # Limit retained text to avoid unlimited memory growth.
-            length = int(
-                self.text.count("1.0", "end-1c", "chars")[0]
-            )
-            excess = length - self._max_chars
-
-            if excess > 0:
-                self.text.delete("1.0", f"1.0+{excess}c")
-
-            self.text.configure(state="disabled")
-
-            # Keep the newest text visible at the right edge.
-            self.text.xview_moveto(1.0)
-
+            if kind == 'status':
+                self._status.set(text)
+            elif kind == 'partial':
+                self._partial = text
+                changed = True
+            else:
+                if text:
+                    self._history += text + ' '
+                self._partial = ''
+                changed = True
+        if changed:
+            self._render()
         self._timer = self.root.after(30, self._drain)
 
     def clear(self):
-        """Clear displayed and queued text. Call on the main thread."""
         while True:
             try:
                 self._queue.get_nowait()
             except queue.Empty:
                 break
-
-        self.text.configure(state="normal")
-        self.text.delete("1.0", "end")
-        self.text.configure(state="disabled")
-        self.text.xview_moveto(0.0)
+        self._history = self._partial = ''
+        self._render()
 
     def close(self):
-        if self._closed.is_set():
-            return
-
-        self._closed.set()
-        self.root.after_cancel(self._timer)
-        self.root.destroy()
+        if not self.closed.is_set():
+            self.closed.set()
+            self.root.after_cancel(self._timer)
+            self.root.destroy()
 
     def run(self):
         self.root.mainloop()
 
 
-def main():
-    popup = LiveSubtitle()
-
-    def demo():
-        transcript = (
-            "Hello, these are live subtitles. "
-            "New words appear from left to right. "
-            "When the line becomes wider than the window, "
-            "the older text scrolls to the left automatically. "
-            "The latest words always remain visible on the right."
-        )
-
-        # Simulate incremental recognition results.
-        for word in transcript.split():
-            if popup._closed.wait(0.25):
-                return
-
-            popup.append_text(word + " ")
-
-    threading.Thread(target=demo, daemon=True).start()
-    popup.run()
-
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    LiveSubtitle().run()

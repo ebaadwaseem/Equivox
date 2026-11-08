@@ -1,3 +1,4 @@
+
 """Offline English microphone transcription for macOS and Windows."""
 import argparse
 from array import array
@@ -20,7 +21,8 @@ NO_AUDIO_TIMEOUT = 3.0
 
 class InputMonitor:
     """Report audio delivery separately from recognition output."""
-    def __init__(self):
+    def __init__(self, display=None):
+        self.display = display
         self.last_signal = float('-inf')
         self.last_text = float('-inf')
         self.last_report = float('-inf')
@@ -52,8 +54,11 @@ class InputMonitor:
         else:
             recognition = 'WAITING_FOR_SPEECH'
         level = 'SIGNAL_DETECTED' if now - self.last_signal < 1.0 else 'QUIET_OR_MUTED'
-        print(f'[status] Microphone: RECEIVING_AUDIO | Input: {level} | '
-              f'Level: {self.peak_dbfs:.1f} dBFS | Recognition: {recognition}', flush=True)
+        message = (f'Microphone: RECEIVING_AUDIO | Input: {level} | '
+                   f'Level: {self.peak_dbfs:.1f} dBFS | Recognition: {recognition}')
+        print('[status] ' + message, flush=True)
+        if self.display is not None:
+            self.display.status(message)
         self.peak_dbfs = -120.0
 
 
@@ -93,7 +98,7 @@ class Display:
             print('[final] ' + text, flush=True)
 
 
-def run(args):
+def run(args, display=None, stop=None):
     try:
         import sounddevice as sd
         from vosk import KaldiRecognizer, Model, SetLogLevel
@@ -117,9 +122,9 @@ def run(args):
     audio = queue.Queue(maxsize=max(2, 2000 // args.block_ms))
     overloaded = threading.Event()
     overflowed = threading.Event()
-    stop = threading.Event()
+    stop = stop if stop is not None else threading.Event()
     last_callback = time.monotonic()
-    monitor = InputMonitor()
+    monitor = InputMonitor(display)
 
     def capture(data, frames, timing, status):
         nonlocal last_callback
@@ -144,7 +149,7 @@ def run(args):
         except (OSError, ValueError):
             pass
 
-    display = Display()
+    display = display if display is not None else Display()
     stream = sd.RawInputStream(device=args.device, samplerate=rate, channels=1,
                                dtype='int16', blocksize=round(rate * args.block_ms / 1000),
                                latency='low', callback=capture)
@@ -159,7 +164,7 @@ def run(args):
                     previous_handlers[sig] = signal.signal(sig, request_stop)
         stream.start()
         last_callback = time.monotonic()
-        print(f'Listening: {info["name"]}, {rate} Hz. Press Enter or Ctrl+C to stop.', file=sys.stderr)
+        print(f'Listening: {info["name"]}, {rate} Hz. Close the subtitle window or press Enter to stop.', file=sys.stderr)
         print('[status] Microphone: OPEN | Recognition: READY | Waiting for audio...', flush=True)
         threading.Thread(target=wait_for_enter, daemon=True).start()
         while not stop.is_set():
@@ -207,14 +212,38 @@ def run(args):
 
 def main():
     args = arguments()
+    if args.list_devices:
+        try:
+            run(args)
+        except Exception as exc:
+            print(f'Error: {exc}', file=sys.stderr)
+            return 1
+        return 0
+    from speech_display import LiveSubtitle
+    popup = LiveSubtitle()
+    errors = []
+
+    def recognize():
+        try:
+            run(args, display=popup, stop=popup.closed)
+        except Exception as exc:
+            errors.append(exc)
+            print(f'Error: {exc}', file=sys.stderr, flush=True)
+            popup.status(f'Error: {exc}')
+        else:
+            popup.status('Microphone: CLOSED | Recognition: STOPPED')
+
+    worker = threading.Thread(target=recognize, daemon=True)
+    worker.start()
     try:
-        run(args)
+        popup.run()
     except KeyboardInterrupt:
+        popup.close()
         return 130
-    except Exception as exc:
-        print(f'Error: {exc}', file=sys.stderr)
-        return 1
-    return 0
+    finally:
+        popup.closed.set()
+        worker.join(timeout=5)
+    return 1 if errors else 0
 
 
 if __name__ == '__main__':
