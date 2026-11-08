@@ -109,3 +109,74 @@ def test_never_crashes_on_empty_element_list(monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     d = _run("click submit", [])
     assert d.is_command is False  # no elements to match, falls through safely
+
+
+def test_find_text(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    d = _run("find refund policy", _elements())
+    assert d.is_command and d.intent == "find" and d.text == "refund policy"
+
+
+def test_site_alias_navigate(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    d = _run("open youtube", _elements())
+    assert d.is_command and d.intent == "navigate" and d.text == "youtube.com"
+
+
+def test_new_tab(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    d = _run("open a new tab", _elements())
+    assert d.is_command and d.intent == "new_tab"
+
+
+def test_new_tab_with_url(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    d = _run("open a new tab to wikipedia.org", _elements())
+    assert d.is_command and d.intent == "new_tab" and d.text == "wikipedia.org"
+
+
+def test_close_tab(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    d = _run("close this tab", _elements())
+    assert d.is_command and d.intent == "close_tab"
+
+
+def test_switch_tab_next(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    d = _run("next tab", _elements())
+    assert d.is_command and d.intent == "switch_tab" and d.text == "next"
+
+
+def test_switch_tab_named(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    d = _run("switch to the gmail tab", _elements())
+    assert d.is_command and d.intent == "switch_tab" and d.text == "gmail"
+
+
+def test_accessibility_bigger_text(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    d = _run("make the text bigger", _elements())
+    assert d.is_command and d.intent == "accessibility" and d.text == "zoom_in"
+
+
+def test_accessibility_high_contrast(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    d = _run("turn on high contrast mode", _elements())
+    assert d.is_command and d.intent == "accessibility" and d.text == "high_contrast_on"
+
+
+def test_switch_tab_next_not_confused_with_new_tab(monkeypatch):
+    # regression: Jev once confused "next tab" (switch) with "new tab" (open new) --
+    # lexically near-identical. The keyword fallback's explicit ordering must not repeat it.
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    d = _run("next tab", _elements())
+    assert d.intent == "switch_tab"
+    d2 = _run("open a new tab", _elements())
+    assert d2.intent == "new_tab"
+
+
+def test_type_with_accessibility_keyword_still_types(monkeypatch):
+    # verb-anchored "type" extraction must win over the loose accessibility matcher
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    d = _run("type increase in the name field", _elements())
+    assert d.is_command and d.intent == "type" and d.text == "increase"

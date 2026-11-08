@@ -43,7 +43,15 @@ class PageState:
 # ---- Person 3 (backend/model) produces these ----
 # "select" added for <select> dropdowns (e.g. "select Tuesday") -- clicking one open headlessly
 # isn't reliable, it needs Playwright's select_option(), so it gets its own intent.
-Intent = Literal["click", "type", "select", "scroll", "navigate", "back", "forward", "search", "none"]
+# "find" is voice Ctrl+F -- scrolls to/highlights arbitrary page TEXT, not just interactive
+# elements, so it doesn't use target_id at all.
+# "new_tab"/"close_tab"/"switch_tab" change which Page is active; main.py handles them before
+# the generic executor since execute() only ever acts on a single already-known page.
+# "accessibility" covers zoom/text-size/high-contrast toggles (Decision.text carries which one).
+Intent = Literal[
+    "click", "type", "select", "scroll", "navigate", "back", "forward", "search", "find",
+    "new_tab", "close_tab", "switch_tab", "accessibility", "none",
+]
 
 
 @dataclass

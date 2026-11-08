@@ -14,6 +14,7 @@ from audio.transcriber import TypedTranscriber
 from backend import jev, policy
 from backend.model import decide
 from backend.scheduler import Scheduler
+from executor import act
 from executor.act import execute, highlight
 from perception.perceive import get_page_state, shortlist, to_prompt_text
 from shared.protocol import Decision, Transcript
@@ -28,6 +29,7 @@ logger = logging.getLogger("main")
 
 AFFIRM = {"yes", "yeah", "yep", "yup", "confirm", "do it", "sure", "go ahead", "ok", "okay"}
 DENY = {"no", "nope", "nah", "cancel", "never mind", "nevermind", "stop", "don't"}
+TAB_INTENTS = {"new_tab", "close_tab", "switch_tab"}
 
 
 async def main() -> None:
@@ -39,17 +41,39 @@ async def main() -> None:
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
         else:
             browser = await p.chromium.launch(headless=False)
-            page = await browser.new_page()
+            # browser.new_page() is a shortcut that creates a context which can't have
+            # more tabs added to it later ("Please use browser.new_context()") -- tab
+            # management needs a real context we can call .new_page() on repeatedly.
+            ctx = await browser.new_context()
+            page = await ctx.new_page()
             await page.goto(START_URL)
 
+        active_page = page  # tab commands can change which Page subsequent commands act on
         recent_actions: list[str] = []
         pending: dict | None = None  # {"kind": "confirm"|"disambiguate", "decision": Decision, ...}
 
         async def run_action(d: Decision) -> None:
+            nonlocal active_page
+            if d.intent in TAB_INTENTS:
+                try:
+                    if d.intent == "new_tab":
+                        active_page = await act.new_tab(ctx, d.text)
+                        print("  ✓ opened new tab", active_page.url)
+                    elif d.intent == "close_tab":
+                        active_page = await act.close_tab(ctx, active_page)
+                        print("  ✓ closed tab, now on", active_page.url)
+                    elif d.intent == "switch_tab":
+                        active_page = await act.switch_tab(ctx, active_page, d.text or "next")
+                        print("  ✓ switched tab ->", active_page.url)
+                    recent_actions.append(f"did {d.intent} {d.text or ''}".strip())
+                    del recent_actions[:-5]
+                except Exception as e:
+                    print("  ✗", e)
+                return
             if d.target_id:
-                await highlight(page, d.target_id)
+                await highlight(active_page, d.target_id)
             try:
-                result = await execute(page, d)
+                result = await execute(active_page, d)
                 print("  ✓", result)
                 recent_actions.append(result)
                 del recent_actions[:-5]
@@ -85,9 +109,9 @@ async def main() -> None:
                         return
                 pending = None  # fall through and treat this as a new command
 
-            state = await get_page_state(page)
+            state = await get_page_state(active_page)
             cands = shortlist(state, t.text)
-            viewport = page.viewport_size
+            viewport = active_page.viewport_size
             vp = (viewport["width"], viewport["height"]) if viewport else None
             prompt_text = to_prompt_text(cands, vp)
 
@@ -106,12 +130,12 @@ async def main() -> None:
                 return
             if outcome == "PREVIEW":
                 if d.target_id:
-                    await highlight(page, d.target_id)
+                    await highlight(active_page, d.target_id)
                 return
             if outcome == "CONFIRM":
                 name = next((e.name for e in cands if e.id == d.target_id), d.target_id or d.intent)
                 if d.target_id:
-                    await highlight(page, d.target_id)
+                    await highlight(active_page, d.target_id)
                 print(f'  ⚠ "{name}" looks irreversible -- say "yes" to confirm or "no" to cancel.')
                 pending = {"kind": "confirm", "decision": d}
                 return

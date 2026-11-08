@@ -36,6 +36,11 @@ INTENT_CRITERIA = {
     "back": "go back to the previous page",
     "forward": "go forward to the next page",
     "search": "run a web search for something",
+    "find": "find/locate specific text or words that are somewhere on the CURRENT page (not a web search)",
+    "new_tab": "open a new browser tab",
+    "close_tab": "close the current browser tab",
+    "switch_tab": "switch to a different already-open browser tab",
+    "accessibility": "adjust page accessibility: make text bigger/smaller, zoom in/out, toggle high-contrast mode",
     "none": "not a browser command at all",
 }
 
@@ -119,6 +124,15 @@ async def decide(
         # evidence this was a command, so floor it rather than let policy IGNORE it.
         is_command_p = max(is_command_p, 0.85)
 
+    # "next tab" vs "new tab" are a near-minimal-pair for a model to confuse (same length,
+    # shared "tab" suffix); extract_tab_switch_query's regex is unambiguous for this exact
+    # phrasing, so trust it over Jev's intent guess here, same reasoning as the pin above.
+    if spans.extract_tab_switch_query(transcript):
+        intent = "switch_tab"
+        target_id = None
+        ambiguous = False
+        is_command_p = max(is_command_p, 0.85)
+
     target_name = next((e.name for e in elements if e.id == target_id), "")
     confidence = is_command_p if target_id is None else min(is_command_p, target_conf)
 
@@ -187,6 +201,14 @@ def _extract_text_for_intent(intent: Intent, transcript: str) -> Optional[str]:
         return spans.extract_url(transcript) or transcript
     if intent == "select":
         return spans.extract_select_value(transcript) or transcript
+    if intent == "find":
+        return spans.extract_find_text(transcript) or transcript
+    if intent == "switch_tab":
+        return spans.extract_tab_switch_query(transcript) or "next"
+    if intent == "new_tab":
+        return spans.extract_new_tab_url(transcript)
+    if intent == "accessibility":
+        return spans.extract_accessibility_action(transcript)
     return None
 
 
@@ -201,6 +223,16 @@ def _keyword_fallback(transcript: str, elements: list[Element]) -> Decision:
         return Decision(True, "forward")
     if t.startswith("scroll"):
         return Decision(True, "scroll", scroll_amount=-600 if "up" in t else 600)
+    if "tab" in t:
+        if t in ("close tab", "close this tab", "close the tab"):
+            return Decision(True, "close_tab")
+        if t in ("new tab", "open a new tab", "open new tab") or t.startswith("open a new tab"):
+            return Decision(True, "new_tab", text=spans.extract_new_tab_url(transcript))
+        if switch := spans.extract_tab_switch_query(transcript):
+            return Decision(True, "switch_tab", text=switch)
+    # verb-anchored extractors (precise, low false-positive risk) go before the loose
+    # substring-matching ones (accessibility) so e.g. "type increase in the name field"
+    # is still recognized as typing, not an accessibility command.
     if url := spans.extract_url(transcript):
         return Decision(True, "navigate", text=url)
     if query := spans.extract_search_query(transcript):
@@ -212,6 +244,10 @@ def _keyword_fallback(transcript: str, elements: list[Element]) -> Decision:
     if type_text := spans.extract_type_text(transcript):
         box = pinned or next((e for e in elements if e.role == "textbox"), None)
         return Decision(True, "type", target_id=box.id if box else None, text=type_text)
+    if find_text := spans.extract_find_text(transcript):
+        return Decision(True, "find", text=find_text)
+    if action := spans.extract_accessibility_action(transcript):
+        return Decision(True, "accessibility", text=action)
     if pinned:
         return Decision(True, "click", target_id=pinned.id, destructive=looks_destructive(pinned.name))
     # "click X": the first shortlisted element whose name matches any of the words

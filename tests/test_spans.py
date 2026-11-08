@@ -1,7 +1,11 @@
 from backend.spans import (
+    extract_accessibility_action,
+    extract_find_text,
+    extract_new_tab_url,
     extract_scroll_amount,
     extract_search_query,
     extract_select_value,
+    extract_tab_switch_query,
     extract_type_text,
     extract_url,
 )
@@ -59,3 +63,75 @@ def test_extract_scroll_amount_large_bigger_than_small():
     small = abs(extract_scroll_amount("scroll down", size="small"))
     large = abs(extract_scroll_amount("scroll down", size="large"))
     assert large > small
+
+
+def test_extract_url_site_alias():
+    assert extract_url("open youtube") == "youtube.com"
+
+
+def test_extract_url_multiword_alias():
+    assert extract_url("open google maps") == "maps.google.com"
+
+
+def test_extract_url_check_verb_alias():
+    assert extract_url("check my email") == "mail.google.com"
+
+
+def test_extract_url_rejects_generic_phrase():
+    assert extract_url("go to the settings page") is None
+
+
+def test_extract_find_text_basic():
+    assert extract_find_text("find refund policy") == "refund policy"
+
+
+def test_extract_find_text_with_page_suffix():
+    assert extract_find_text("find the refund policy on this page") == "the refund policy"
+
+
+def test_extract_find_text_look_for_synonym():
+    assert extract_find_text("look for free shipping") == "free shipping"
+
+
+def test_extract_tab_switch_query_next():
+    assert extract_tab_switch_query("next tab") == "next"
+
+
+def test_extract_tab_switch_query_previous_phrased():
+    assert extract_tab_switch_query("switch to the previous tab") == "previous"
+
+
+def test_extract_tab_switch_query_named_with():
+    assert extract_tab_switch_query("switch to the tab with gmail") == "gmail"
+
+
+def test_extract_tab_switch_query_named_suffix():
+    assert extract_tab_switch_query("switch to the gmail tab") == "gmail"
+
+
+def test_extract_new_tab_url_present():
+    assert extract_new_tab_url("open a new tab to wikipedia.org") == "wikipedia.org"
+
+
+def test_extract_new_tab_url_absent():
+    assert extract_new_tab_url("open a new tab") is None
+
+
+def test_extract_accessibility_bigger():
+    assert extract_accessibility_action("make the text bigger") == "zoom_in"
+
+
+def test_extract_accessibility_smaller():
+    assert extract_accessibility_action("make it smaller") == "zoom_out"
+
+
+def test_extract_accessibility_high_contrast_on():
+    assert extract_accessibility_action("turn on high contrast mode") == "high_contrast_on"
+
+
+def test_extract_accessibility_high_contrast_off():
+    assert extract_accessibility_action("turn off high contrast") == "high_contrast_off"
+
+
+def test_extract_accessibility_reset():
+    assert extract_accessibility_action("reset the zoom") == "reset"
