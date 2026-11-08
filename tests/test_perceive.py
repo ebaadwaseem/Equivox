@@ -11,6 +11,7 @@ from shared.protocol import Element, PageState
 
 FORM_FIXTURE = (Path(__file__).parent / "fixtures" / "pages" / "form.html").resolve().as_uri()
 RESULTS_FIXTURE = (Path(__file__).parent / "fixtures" / "pages" / "results.html").resolve().as_uri()
+OVERLAY_JS = (Path(__file__).parent.parent / "ui" / "overlay.js").read_text()
 
 
 def make_state(*elements: Element) -> PageState:
@@ -269,3 +270,46 @@ def test_ordinal_plain_link_still_counts_header_links(results_state):
     # "second link" (no "result" word) should NOT apply the chrome filter -- it's generic
     first_link = find_deterministic_target(results_state.elements, "click the first link")
     assert first_link.name == "ExampleSearch"
+
+
+# ---- the Vox overlay must never block or appear as a page element ------
+
+async def _load_form_state_with_overlay() -> tuple[PageState, "object"]:
+    async with async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page()
+        await page.add_init_script(OVERLAY_JS)
+        await page.goto(FORM_FIXTURE)
+        await page.wait_for_selector("#vox-host", timeout=3000, state="attached")
+        state = await get_page_state(page)
+        # verify the real page's own bottom-right button is still actually clickable,
+        # not just "found" -- Playwright's click() would time out if the overlay
+        # intercepted pointer events at that location
+        corner = next(e for e in state.elements if e.name == "Corner Action")
+        await page.locator(f'[data-vb-id="{corner.id}"]').click(timeout=3000)
+        clicked = await page.evaluate(
+            "() => document.getElementById('corner-btn').dataset.clicked === '1'"
+        )
+        await browser.close()
+        return state, clicked
+
+
+@pytest.fixture(scope="module")
+def form_state_with_overlay():
+    return asyncio.run(_load_form_state_with_overlay())
+
+
+def test_overlay_host_not_extracted_as_element(form_state_with_overlay):
+    state, _ = form_state_with_overlay
+    assert all(e.id != "vox-host" for e in state.elements)
+    assert not any("vox" in (e.name or "").lower() for e in state.elements)
+
+
+def test_corner_button_found_despite_overlay(form_state_with_overlay):
+    state, _ = form_state_with_overlay
+    assert any(e.name == "Corner Action" for e in state.elements)
+
+
+def test_corner_button_still_clickable_through_overlay(form_state_with_overlay):
+    _, clicked = form_state_with_overlay
+    assert clicked is True

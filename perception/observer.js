@@ -22,6 +22,8 @@
     const cy = Math.min(Math.max(r.y + r.height / 2, 0), innerHeight - 1);
     const top = document.elementFromPoint(cx, cy);
     if (!top) return false;
+    // the voice-assistant overlay sits on top visually but must never block real clicks
+    if (top.id === 'vox-host') return false;
     return !(top === el || el.contains(top) || top.contains(el));
   }
 
@@ -137,6 +139,9 @@
                                // URL text, and the snippet in separate <a> tags to the same href.
 
   for (const el of document.querySelectorAll(SELECTOR)) {
+    // the overlay lives in a Shadow DOM so document.querySelectorAll can never actually
+    // see inside it, but skip defensively in case that ever changes.
+    if (el.id === 'vox-host' || (el.closest && el.closest('#vox-host'))) continue;
     const r = el.getBoundingClientRect();
     if (r.width < 2 || r.height < 2) continue;
     const style = getComputedStyle(el);
