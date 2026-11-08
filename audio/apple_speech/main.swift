@@ -19,11 +19,19 @@ import Speech
 
 // MARK: - JSON output
 
+// emit() is called from the audio tap's realtime thread (levels) AND the main thread
+// (partials/finals/status) -- without serializing, two concurrent prints can interleave
+// their bytes mid-line and corrupt the JSON stream. One serial queue for all stdout
+// writes keeps each line atomic regardless of which thread produced it.
+let emitQueue = DispatchQueue(label: "com.equivox.listener.emit")
+
 func emit(_ dict: [String: Any]) {
     guard let data = try? JSONSerialization.data(withJSONObject: dict) else { return }
     guard let str = String(data: data, encoding: .utf8) else { return }
-    print(str)
-    fflush(stdout)
+    emitQueue.async {
+        print(str)
+        fflush(stdout)
+    }
 }
 
 func emitPartial(id: Int, text: String) {
@@ -280,6 +288,12 @@ final class Listener {
 
 parseArgs()
 
+// Listener itself is only ever reached via weak captures (the audio tap closure, its
+// timers, the recognition task callback) so nothing keeps it alive on its own -- without
+// a strong top-level reference it's deallocated (tearing down its AVAudioEngine) the
+// moment the speech-auth callback below returns, right after start() kicks everything off.
+var activeListener: Listener?
+
 signal(SIGTERM) { _ in exit(0) }
 signal(SIGINT) { _ in exit(0) }
 
@@ -315,6 +329,7 @@ requestMicAuth { micGranted in
             exit(1)
         }
         let listener = Listener(recognizer: recognizer)
+        activeListener = listener
         emitStatus("listening")
         listener.start()
     }
