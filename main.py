@@ -11,8 +11,11 @@ from typing import Optional
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 
+from audio.apple_transcriber import AppleSpeechTranscriber
+from audio.apple_transcriber import is_available as apple_speech_available
 from audio.transcriber import TypedTranscriber
 from backend import jev, policy, spans
+from backend.early_commit import EarlyCommitTracker
 from backend.model import decide
 from backend.scheduler import Scheduler
 from executor import act, undo
@@ -37,6 +40,10 @@ PREV_PAGE_PHRASES = {"previous page"}
 SITE_OPENED_WINDOW_S = 2.0  # no user command running in this window -> an unprompted popup
 TAB_INTENTS = {"new_tab", "close_tab", "switch_tab"}
 ERROR_REVERT_S = 4.0
+
+PAUSE_LISTENING_PHRASES = {"stop listening", "pause listening"}
+RESUME_LISTENING_PHRASES = {"start listening", "resume listening"}
+TOGGLE_LISTENING_PHRASES = {"toggle listening"}
 
 
 def _target_name(d: Decision, cands: list[Element]) -> str:
@@ -83,6 +90,13 @@ async def main() -> None:
         last_command_ts = 0.0  # when the most recent user command STARTED executing
         last_scroll: Optional[Decision] = None  # for "keep scrolling"/"more"/"again"
         pending: dict | None = None  # {"kind": "confirm"|"disambiguate"|"undo_disambiguate", ...}
+        listening_paused = False
+        apple_transcriber: Optional[AppleSpeechTranscriber] = None
+
+        # early-commit-on-partials: keyed internally by Transcript.id (None for
+        # typed/panel input, which naturally opts out of all of this).
+        early_commit = EarlyCommitTracker()
+        first_partial_ts: dict[int, float] = {}
 
         async def on_new_page(new_page) -> None:
             """Detects popups/new tabs the PAGE itself opened (target=_blank, window.open)
@@ -214,13 +228,42 @@ async def main() -> None:
             pending = {"kind": "undo_disambiguate", "candidates": candidates}
 
         async def handle(t: Transcript) -> None:
-            nonlocal pending, active_page
+            nonlocal pending, active_page, listening_paused
             t_start = time.perf_counter()
             text_norm = t.text.strip().lower()
+
+            if t.id is not None:
+                if early_commit.already_committed(t.id):
+                    return  # already acted on this utterance via early commit -- ignore
+                first_partial_ts.setdefault(t.id, t_start)
+                if t.is_final:
+                    # the partial-tracking part of this utterance's life is over either way
+                    early_commit.forget(t.id)
+                    first_partial_ts.pop(t.id, None)
 
             await vox.set(active_page, "listening", t.text)
 
             # UI-only meta-commands: deterministic, never go through Jev.
+            if text_norm in PAUSE_LISTENING_PHRASES or (
+                text_norm in TOGGLE_LISTENING_PHRASES and not listening_paused
+            ):
+                if apple_transcriber is not None:
+                    await apple_transcriber.pause()
+                listening_paused = True
+                print("  ✓ paused listening")
+                await vox.set(active_page, "idle", "Paused")
+                pending = None
+                return
+            if text_norm in RESUME_LISTENING_PHRASES or (
+                text_norm in TOGGLE_LISTENING_PHRASES and listening_paused
+            ):
+                if apple_transcriber is not None:
+                    await apple_transcriber.resume()
+                listening_paused = False
+                print("  ✓ resumed listening")
+                await vox.set(active_page, "idle")
+                pending = None
+                return
             if vox.is_hide_command(t.text):
                 await vox.hide(active_page)
                 print("  ✓ hid Vox")
@@ -297,8 +340,21 @@ async def main() -> None:
             d = await decide(t.text, t.is_final, prompt_text, cands, recent_actions)
             decide_ms = (time.perf_counter() - decide_t0) * 1000
 
-            outcome = policy.decide_outcome(d, t.is_final)
             target_name = _target_name(d, cands)
+
+            # EARLY COMMIT: act on a partial, before the ~700ms endpoint-triggered final,
+            # for intents with no free text to get wrong -- only once confidence is high
+            # AND the same target has held steady across 2 consecutive partials.
+            if early_commit.should_commit(t.id, d, t.is_final):
+                latency_ms = (t_start - first_partial_ts.pop(t.id, t_start)) * 1000
+                logger.info(
+                    "early commit: id=%s intent=%s target=%s first_partial_to_action_ms=%.0f",
+                    t.id, d.intent, d.target_id, latency_ms,
+                )
+                await run_action(d, target_name)
+                return
+
+            outcome = policy.decide_outcome(d, t.is_final)
             logger.info(
                 "transcript=%r final=%s -> %s intent=%s target=%s conf=%.2f decide_ms=%.0f total_ms=%.0f",
                 t.text, t.is_final, outcome, d.intent, d.target_id, d.confidence,
@@ -365,13 +421,44 @@ async def main() -> None:
             async for t in TypedTranscriber().stream():
                 input_queue.put_nowait(t)
 
-        terminal_task = asyncio.create_task(feed_terminal())
+        tasks = [asyncio.create_task(feed_terminal())]
+
+        # VB_TRANSCRIBER=apple|typed selects the mic transcriber; defaults to apple if
+        # the Swift listener binary has been built, else falls back to typed-only. The
+        # terminal (and the Vox panel's typed-command box, via voxCommand above) stay
+        # active regardless -- they're the fallback this whole thing must not break.
+        transcriber_choice = os.getenv("VB_TRANSCRIBER", "apple" if apple_speech_available() else "typed")
+        if transcriber_choice == "apple":
+            if not apple_speech_available():
+                print("  ⚠ VB_TRANSCRIBER=apple but bin/vox-listen is missing -- run scripts/build_listener.sh. "
+                      "Falling back to typed input only.")
+            else:
+                async def on_mic_level(value: float) -> None:
+                    await vox.set_level(active_page, value)
+
+                async def on_mic_status(kind: str, detail: str) -> None:
+                    if kind == "error":
+                        logger.warning("voice listener: %s", detail)
+                        print("  ⚠ voice listener:", detail)
+                    else:
+                        logger.info("voice listener status: %s %s", kind, detail)
+
+                apple_transcriber = AppleSpeechTranscriber(on_level=on_mic_level, on_status=on_mic_status)
+
+                async def feed_apple() -> None:
+                    async for t in apple_transcriber.stream():
+                        if not listening_paused:
+                            input_queue.put_nowait(t)
+
+                tasks.append(asyncio.create_task(feed_apple()))
+
         try:
             while True:
                 t = await input_queue.get()
                 sched.submit(t)
         finally:
-            terminal_task.cancel()
+            for task in tasks:
+                task.cancel()
             await jev.aclose()
 
 

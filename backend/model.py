@@ -198,6 +198,8 @@ async def decide(
         destructive=destructive,
         ambiguous=ambiguous,
         target_confidence=target_conf,
+        is_command_confidence=is_command_p,
+        complete_confidence=complete_p,
     )
 
 

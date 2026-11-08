@@ -77,9 +77,11 @@
   <button type="button" class="danger" id="delete-account">Delete account</button>
 </form>
 
-<!-- a real page's own bottom-right floating button (e.g. a chat widget), sitting right
-     where the Vox overlay renders -- must stay findable and clickable regardless -->
-<button type="button" id="corner-btn" style="position:fixed; bottom:20px; right:20px; z-index:1000; padding:10px 16px;"
+<!-- a real page's own bottom-right floating button (e.g. a chat widget), sitting in the
+     Vox overlay's panel footprint (not directly on the mascot's painted droplet pixels,
+     which are deliberately clickable so users can click it to toggle listening) --
+     must stay findable and clickable regardless -->
+<button type="button" id="corner-btn" style="position:fixed; bottom:60px; right:250px; z-index:1000; padding:10px 16px;"
         onclick="this.dataset.clicked = '1'">Corner Action</button>
 </body>
 </html>

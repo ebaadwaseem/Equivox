@@ -6,7 +6,7 @@
 // EXACTLY from ui/vox-mascot.html, the source of truth -- only host/sizing/mount
 // plumbing, fail-safes, and the typed-command wiring are new.
 //
-// Public API: window.__vox = { set(state, text, level, minimized) }
+// Public API: window.__vox = { set(state, text, level, minimized), setLevel(level) }
 (() => {
   if (window.__voxMounting) return;
   window.__voxMounting = true;
@@ -54,8 +54,13 @@
       .stage { display: flex; align-items: flex-end; gap: 12px; font-family: "Segoe UI", system-ui, -apple-system, sans-serif; }
 
       /* ---------- the mascot ---------- */
-      .vox { width: 110px; height: 110px; position: relative; pointer-events: none; margin: 8px; }
-      .vox svg { width: 100%; height: 100%; overflow: hidden; } /* nothing can spill out and get clipped by the screen edge */
+      /* clickable even at normal size (not just minimized) -- clicking it toggles
+         listening pause/resume. The DIV stays click-through (pointer-events:none);
+         only the <svg>'s actual PAINTED pixels (pointer-events:auto resolves to
+         "visiblePainted" inside SVG content) are hit-testable, so the transparent
+         padding around the droplet still lets real page clicks through underneath. */
+      .vox { width: 110px; height: 110px; position: relative; pointer-events: none; cursor: pointer; margin: 8px; }
+      .vox svg { width: 100%; height: 100%; overflow: hidden; pointer-events: auto; } /* nothing can spill out and get clipped by the screen edge */
       .vox .body-g { transform-origin: 100px 110px; animation: bob 3.2s ease-in-out infinite; }
       .vox .eyes  { transform-origin: 100px 100px; transition: transform .25s ease; }
       .vox .eye   { transform-box: fill-box; transform-origin: center; transition: transform .2s ease; }
@@ -103,6 +108,34 @@
 
       @media (prefers-reduced-motion: reduce) {
         .vox * { animation: none !important; }
+        .panel .text, .panel .text * { transition: none !important; animation: none !important; }
+      }
+
+      /* ---------- live transcript: word-diffing ---------- */
+      /* max 2 lines; a soft mask (not a hard clip) fades out whatever scrolls past the
+         top edge, so overflow feels like it's continuously scrolling up rather than
+         getting chopped off. */
+      .panel .text {
+        font-size: 20px; font-weight: 600; text-shadow: 0 1px 0 rgba(255,255,255,.8); margin-top: 4px; color: #06182b;
+        min-height: 1.4em; max-height: 2.8em; line-height: 1.4em; overflow: hidden; position: relative;
+        -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 1.1em, #000 100%);
+        mask-image: linear-gradient(to bottom, transparent 0, #000 1.1em, #000 100%);
+        transition: opacity .12s ease;
+      }
+      .panel .text.crossfade-out { opacity: 0; }
+      .panel .text .w {
+        display: inline-block; margin-right: .28em; opacity: 1; transform: translateY(0);
+        transition: opacity .12s ease, transform .12s ease;
+      }
+      .panel .text .w.enter { opacity: 0; transform: translateY(5px); }
+      .panel .text .w.tail { opacity: .65; } /* last 2 words of a live partial -- still uncertain */
+
+      /* visually hidden but still reachable by screen readers -- carries ONLY finals
+         and action results (see updateAriaLive in JS); the visible .text above updates
+         on every partial too, which would be announced far too often if it were live. */
+      .sr-only {
+        position: absolute; width: 1px; height: 1px; overflow: hidden;
+        clip: rect(0, 0, 0, 0); white-space: nowrap;
       }
 
       /* ---------- frosted transcript panel (Frutiger Aero) ---------- */
@@ -162,10 +195,11 @@
     stage.className = "stage";
     stage.dataset.state = "idle";
     stage.innerHTML = `
-      <div class="panel" aria-live="polite">
+      <div class="panel">
         <button class="hide" id="hide" aria-label="Hide Vox" title="Hide (or say 'hide Vox')">–</button>
         <div class="label" id="label">Idle</div>
-        <div class="text" id="text">Say something like "search for physio clinics"</div>
+        <div class="text" id="text"><span id="text-inner"></span></div>
+        <div class="sr-only" id="sr-live" aria-live="polite" aria-atomic="true"></div>
         <div class="cmd-row">
           <input id="cmd-input" type="text" placeholder="Type a command…" aria-label="Type a voice command" />
         </div>
@@ -238,6 +272,8 @@
     const voxEl = shadow.getElementById("vox");
     const labelEl = shadow.getElementById("label");
     const textEl = shadow.getElementById("text");
+    const textInnerEl = shadow.getElementById("text-inner");
+    const srLiveEl = shadow.getElementById("sr-live");
     const cmdInput = shadow.getElementById("cmd-input");
     const hideBtn = shadow.getElementById("hide");
 
@@ -245,8 +281,110 @@
       if (typeof window.voxCommand === "function") window.voxCommand(text);
     }
 
+    const prefersReducedMotion =
+      window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
     let currentState = "idle";
     let currentText = "";
+    let wasListening = false; // was the PREVIOUS applyFace call also "listening"? (continuation vs fresh)
+
+    // --- live transcript rendering: word-diffing for in-place partial updates, a
+    // plain crossfade for everything else (state changes, action text, idle). Both
+    // paths are coalesced through one requestAnimationFrame per tick so several
+    // applyFace() calls landing in the same frame only touch the DOM once.
+    function wordsOf(text) {
+      return text.split(/\s+/).filter(Boolean);
+    }
+
+    function setWordsInstant(words, tailCount) {
+      cancelPendingCrossfade();
+      textInnerEl.innerHTML = "";
+      words.forEach((word, i) => {
+        const span = document.createElement("span");
+        span.className = "w" + (tailCount && i >= words.length - tailCount ? " tail" : "");
+        span.textContent = word;
+        textInnerEl.appendChild(span);
+      });
+      textEl.scrollTop = textEl.scrollHeight; // pin to the latest 2 lines; the CSS mask softens the rest
+    }
+
+    // crossfadeWords() writes the DOM from a delayed setTimeout, not immediately --
+    // if a newer update (another crossfade, or a word-diff) arrives before that timer
+    // fires, the stale write must never land on top of it. At most one crossfade timer
+    // is ever outstanding; anything that changes the text cancels it first.
+    let crossfadeTimer = null;
+
+    function cancelPendingCrossfade() {
+      if (crossfadeTimer !== null) {
+        clearTimeout(crossfadeTimer);
+        crossfadeTimer = null;
+      }
+    }
+
+    function renderWordsDiff(words) {
+      // unchanged leading words are left alone entirely (no DOM touch, no animation);
+      // a word that differs from what's already at that index crossfades in place;
+      // words appended past the old length fade+slide in. The last 2 words stay
+      // dimmer than the rest while the utterance is still live.
+      cancelPendingCrossfade(); // a diff update supersedes any fade-out still in flight
+      textEl.classList.remove("crossfade-out");
+      const existing = Array.from(textInnerEl.children);
+      words.forEach((word, i) => {
+        const isTail = i >= words.length - 2;
+        let span = existing[i];
+        if (!span) {
+          span = document.createElement("span");
+          span.className = "w enter";
+          span.textContent = word;
+          textInnerEl.appendChild(span);
+          requestAnimationFrame(() => span.classList.remove("enter"));
+        } else if (span.textContent !== word) {
+          span.textContent = word;
+          span.classList.remove("enter");
+          void span.offsetWidth; // restart the transition
+          span.classList.add("enter");
+          requestAnimationFrame(() => span.classList.remove("enter"));
+        }
+        span.classList.toggle("tail", isTail);
+      });
+      for (let i = existing.length - 1; i >= words.length; i--) existing[i].remove();
+      textEl.scrollTop = textEl.scrollHeight;
+    }
+
+    function crossfadeWords(words) {
+      cancelPendingCrossfade();
+      textEl.classList.add("crossfade-out");
+      crossfadeTimer = setTimeout(() => {
+        crossfadeTimer = null;
+        setWordsInstant(words, 0);
+        textEl.classList.remove("crossfade-out");
+      }, 120);
+    }
+
+    let pendingWords = null;
+    let pendingContinuation = false;
+    let rafScheduled = false;
+
+    function scheduleWordsRender(words, isContinuation) {
+      pendingWords = words;
+      pendingContinuation = isContinuation;
+      if (rafScheduled) return;
+      rafScheduled = true;
+      requestAnimationFrame(() => {
+        rafScheduled = false;
+        if (pendingContinuation) renderWordsDiff(pendingWords);
+        else crossfadeWords(pendingWords);
+      });
+    }
+
+    // the hidden aria-live region: only ever updated for results the user actually
+    // needs announced -- never for "listening"/"thinking" (partials would spam a
+    // screen reader every ~65ms) or the default idle placeholder (unchanging noise).
+    function updateAriaLive(state, shown) {
+      if (state === "acting" || state === "unsure" || state === "error") {
+        srLiveEl.textContent = shown;
+      }
+    }
 
     function applyFace(state, text, level) {
       const meta = STATES[state] || STATES.idle;
@@ -255,7 +393,19 @@
       voxEl.setAttribute("aria-label", "Vox assistant: " + state);
       labelEl.textContent = meta[0];
       const shown = (text !== undefined && text !== null && text !== "") ? text : meta[1];
-      textEl.textContent = shown;
+
+      if (shown !== currentText) {
+        const words = wordsOf(shown);
+        const isContinuation = state === "listening" && wasListening;
+        if (prefersReducedMotion) {
+          setWordsInstant(words, 0); // instant text updates only, no animation
+        } else {
+          scheduleWordsRender(words, isContinuation);
+        }
+        updateAriaLive(state, shown);
+      }
+      wasListening = (state === "listening");
+
       if (typeof level === "number") {
         voxEl.style.setProperty("--level", String(Math.max(0, Math.min(1, level))));
       }
@@ -290,7 +440,14 @@
 
     hideBtn.addEventListener("click", () => { minimize(); sendCommand("minimize"); });
     voxEl.addEventListener("click", () => {
-      if (stage.classList.contains("min")) { restore(); sendCommand("show vox"); }
+      if (stage.classList.contains("min")) {
+        restore();
+        sendCommand("show vox");
+      } else {
+        // Python owns whether listening is actually paused right now; it decides
+        // what "toggle" means and sets the resulting state/text back on us.
+        sendCommand("toggle listening");
+      }
     });
 
     // --- typed-command input: history, submit, and isolating keystrokes from the page ---
@@ -387,7 +544,13 @@
     syncHighContrast();
     new MutationObserver(syncHighContrast).observe(document.head, { childList: true });
 
-    window.__vox = { set: setVoxState };
+    function setLevel(level) {
+      // high-frequency mic-level updates (~10-15/s) -- only touches --level, skips
+      // the full state/text/minimized pipeline above.
+      voxEl.style.setProperty("--level", String(Math.max(0, Math.min(1, level))));
+    }
+
+    window.__vox = { set: setVoxState, setLevel };
     setVoxState("idle");
   }
 

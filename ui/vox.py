@@ -106,6 +106,15 @@ async def show(page: Page) -> None:
     await _apply(page)
 
 
+async def set_level(page: Page, value: float) -> None:
+    """High-frequency mic-level updates (~10-15/s while listening) -- a lightweight
+    path that only touches the --level CSS var, skipping the full state/text pipeline."""
+    try:
+        await page.evaluate("v => window.__vox && window.__vox.setLevel && window.__vox.setLevel(v)", value)
+    except Exception as e:
+        logger.debug("level update skipped: %s", e)
+
+
 async def show_on(page: Page) -> None:
     """Call after switching the active tab (new_tab/switch_tab/close_tab/undo) so the
     overlay on the newly-active page reflects whatever state (and minimized flag) is

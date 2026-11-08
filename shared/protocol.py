@@ -9,6 +9,9 @@ class Transcript:
     text: str
     is_final: bool          # False = partial (still talking), True = utterance finished
     confidence: float = 1.0
+    id: Optional[int] = None  # groups a stream of partials + their final into one utterance
+                               # (set by audio/apple_transcriber.py; None for typed/panel input,
+                               # which naturally opts those sources out of early-commit tracking)
 
 
 # ---- Person 2 (perception) produces these ----
@@ -72,3 +75,7 @@ class Decision:
     ambiguous: bool = False           # top-2 target candidates are too close to call automatically
     target_confidence: float = 1.0    # how sure the model is about target_id specifically
     scroll_to: Optional[str] = None   # "top" | "bottom" -- overrides scroll_amount when set
+    # raw probabilities behind the already-thresholded is_command/complete booleans above
+    # (those threshold at 0.5; early-commit-on-partials needs the stricter 0.85/0.8 bars).
+    is_command_confidence: float = 1.0
+    complete_confidence: float = 1.0
