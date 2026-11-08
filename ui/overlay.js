@@ -2,10 +2,11 @@
 // every page/tab and survives navigation. Lives entirely inside a Shadow DOM host
 // (#vox-host) so page CSS can't touch it and it can't touch the page.
 //
-// Design (SVG, colours, animations, states, panel styling) is unchanged from
-// ui/vox-mascot.html -- only the host/sizing/mount plumbing is new.
+// Design (SVG, colours, animations, states, panel styling, hide/minimize) is ported
+// EXACTLY from ui/vox-mascot.html, the source of truth -- only host/sizing/mount
+// plumbing, fail-safes, and the typed-command wiring are new.
 //
-// Public API: window.__vox = { set(state, text, level) }
+// Public API: window.__vox = { set(state, text, level, minimized) }
 (() => {
   if (window.__voxMounting) return;
   window.__voxMounting = true;
@@ -16,10 +17,11 @@
     thinking:  ["Thinking…",     ""],
     acting:    ["Done",          ""],
     unsure:    ["Did you mean…", ""],
-    error:     ["Hmm",           "I couldn't find that on this page"],
+    error:     ["Oops",          "I couldn't find that on this page"],
   };
 
   const HOST_ID = "vox-host";
+  const HC_STYLE_ID = "vb-high-contrast"; // keep in sync with executor/act.py
 
   function whenBodyReady(cb) {
     if (document.body) { cb(); return; }
@@ -35,7 +37,7 @@
   }
 
   function mount() {
-    if (document.getElementById(HOST_ID)) return;
+    if (document.getElementById(HOST_ID)) return; // double-injection guard
 
     const host = document.createElement("div");
     host.id = HOST_ID;
@@ -49,7 +51,7 @@
     const style = document.createElement("style");
     style.textContent = `
       * { box-sizing: border-box; }
-      .wrap { display: flex; align-items: flex-end; gap: 12px; font-family: "Segoe UI", system-ui, -apple-system, sans-serif; }
+      .stage { display: flex; align-items: flex-end; gap: 12px; font-family: "Segoe UI", system-ui, -apple-system, sans-serif; }
 
       /* ---------- the mascot ---------- */
       .vox { width: 110px; height: 110px; position: relative; pointer-events: none; }
@@ -58,8 +60,13 @@
       .vox .eyes  { transform-origin: 100px 100px; transition: transform .25s ease; }
       .vox .eye   { transform-box: fill-box; transform-origin: center; transition: transform .2s ease; }
       .vox .lid   { transform-box: fill-box; transform-origin: center; transform: scaleY(0); }
-      .vox .happy, .vox .brow, .vox .q, .vox .sweat { opacity: 0; transition: opacity .2s; }
-      .vox .ring  { opacity: 0; transform-origin: 100px 100px; }
+      .vox .happy, .vox .brow, .vox .q, .vox .sweat, .vox .worry { transition: opacity .2s; }
+      /* fail-safes already set opacity:0 as inline attributes (survives a blocked stylesheet);
+         these !important rules are what's needed to turn them back ON per state. */
+      .vox.acting .happy { opacity: 1 !important; }
+      .vox.unsure .brow, .vox.unsure .q { opacity: 1 !important; }
+      .vox.error .worry { opacity: 1 !important; }
+      .vox.listening .ring { opacity: 1 !important; animation: ring 1.4s ease-out infinite; }
 
       /* idle: bob + blink */
       .vox.idle .eye { animation: blink 4s infinite; }
@@ -67,62 +74,119 @@
       /* listening: wide eyes, pulse with mic level */
       .vox.listening .eye { transform: scale(1.15); }
       .vox.listening .body-g { animation: none; transform: scale(calc(1 + var(--level, 0) * .08)); transition: transform .08s; }
-      .vox.listening .ring { opacity: 1; animation: ring 1.4s ease-out infinite; }
 
       /* thinking: eyes look side to side */
       .vox.thinking .eyes { animation: look 1.2s ease-in-out infinite; }
 
       /* acting: happy ^ ^ and a hop */
       .vox.acting .eye { opacity: 0; }
-      .vox.acting .happy { opacity: 1; }
       .vox.acting .body-g { animation: hop .6s ease-out infinite; }
 
       /* unsure: tilt, brow, question bubble */
       .vox.unsure .body-g { animation: none; transform: rotate(-10deg); transition: transform .3s; }
-      .vox.unsure .brow, .vox.unsure .q { opacity: 1; }
       .vox.unsure .eye.r { transform: scaleY(.8); }
 
-      /* error: wobble + worried */
-      .vox.error .body-g { animation: wobble .5s ease-in-out infinite; }
-      .vox.error .eye { transform: scaleY(.75); }
-      .vox.error .sweat { opacity: 1; }
+      /* error: one flinch, worried brows, dripping sweat (friendly, not alarming) */
+      .vox.error .body-g { animation: flinch .5s ease-in-out 1; }
+      .vox.error .eye { transform: scaleY(.8) translateY(2px); }
+      .vox .sweat { transform-box: fill-box; transform-origin: center top; }
+      .vox.error .sweat   { opacity: 1 !important; animation: drip 1.4s ease-in .2s infinite; }
+      .vox.error .sweat.s2 { opacity: 1 !important; animation: drip 1.4s ease-in .9s infinite; }
 
       @keyframes bob    { 0%,100% { transform: translateY(0) } 50% { transform: translateY(-6px) } }
       @keyframes blink  { 0%,92%,100% { transform: scaleY(1) } 95% { transform: scaleY(.1) } }
       @keyframes look   { 0%,100% { transform: translateX(-7px) } 50% { transform: translateX(7px) } }
       @keyframes hop    { 0%,100% { transform: translateY(0) scale(1,1) } 30% { transform: translateY(-14px) scale(.96,1.04) } 60% { transform: translateY(0) scale(1.05,.95) } }
-      @keyframes wobble { 0%,100% { transform: rotate(0) } 25% { transform: rotate(-6deg) } 75% { transform: rotate(6deg) } }
+      @keyframes flinch { 0%,100% { transform: translateX(0) rotate(0) } 20% { transform: translateX(-6px) rotate(-5deg) } 45% { transform: translateX(5px) rotate(4deg) } 70% { transform: translateX(-2px) rotate(-1deg) } }
+      @keyframes drip   { 0% { opacity: 0; transform: translateY(-4px) scale(.6) } 15% { opacity: 1; transform: translateY(0) scale(1) } 75% { opacity: 1; transform: translateY(26px) scale(1,1.15) } 100% { opacity: 0; transform: translateY(34px) scale(.8,1.2) } }
       @keyframes ring   { from { transform: scale(.85); opacity: .7 } to { transform: scale(1.35); opacity: 0 } }
 
       @media (prefers-reduced-motion: reduce) {
         .vox * { animation: none !important; }
       }
 
-      /* ---------- frosted transcript panel ---------- */
+      /* ---------- liquid-glass transcript panel ---------- */
       .panel {
         width: min(360px, 60vw); padding: 14px 18px; border-radius: 18px;
-        background: rgba(255,255,255,.88); backdrop-filter: blur(14px);
-        border: 1px solid rgba(255,255,255,.9);
-        box-shadow: 0 8px 30px rgba(20,80,140,.18), inset 0 1px 0 #fff;
-        pointer-events: none; color: #0b2540;
+        background: linear-gradient(160deg, rgba(255,255,255,.16), rgba(255,255,255,.03));
+        backdrop-filter: saturate(150%) brightness(1.06); -webkit-backdrop-filter: saturate(150%) brightness(1.06);
+        border: 1px solid rgba(255,255,255,.55);
+        box-shadow:
+          0 10px 30px rgba(0,30,60,.22),
+          inset 1.5px 1.5px 0 rgba(255,255,255,.95),
+          inset -1px -1px 0 rgba(255,255,255,.35),
+          inset 0 0 18px rgba(255,255,255,.18);
+        isolation: isolate;
+        text-shadow: 0 0 8px #fff, 0 0 4px #fff, 0 0 2px #fff;
+        position: relative;
+        pointer-events: none;
       }
-      .panel .label { font-size: 12px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: #1d5f8a; }
-      .panel .text  { font-size: 20px; margin-top: 4px; color: #0b2540; min-height: 1.4em; }
+      .panel::before {           /* frost layer that fades out toward the edges */
+        content: ""; position: absolute; inset: 0; border-radius: inherit; z-index: -1;
+        background: rgba(255,255,255,.30);
+        backdrop-filter: blur(18px) saturate(170%); -webkit-backdrop-filter: blur(18px) saturate(170%);
+        -webkit-mask: radial-gradient(ellipse 75% 85% at 45% 55%, #000 60%, transparent 100%);
+                mask: radial-gradient(ellipse 75% 85% at 45% 55%, #000 60%, transparent 100%);
+      }
+      .panel::after {            /* glossy streak along the top edge */
+        content: ""; position: absolute; left: 12px; right: 12px; top: 2px; height: 40%;
+        border-radius: 14px 14px 40% 40%; pointer-events: none;
+        background: linear-gradient(180deg, rgba(255,255,255,.35), rgba(255,255,255,0));
+      }
+      /* status chip: solid colour + white text, readable on any background */
+      .panel .label {
+        display: inline-block; padding: 3px 10px 3px 9px; border-radius: 999px;
+        font-size: 13px; font-weight: 800; letter-spacing: .05em; text-transform: uppercase;
+        color: #fff; text-shadow: none; background: #4b5563;
+        box-shadow: 0 1px 3px rgba(0,0,0,.25), inset 0 1px 0 rgba(255,255,255,.35);
+      }
+      .panel .label::before { content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+        background: #fff; margin-right: 6px; vertical-align: 1px; opacity: .9; }
+      .stage[data-state="listening"] .panel .label { background: #0f7a45; }
+      .stage[data-state="listening"] .panel .label::before { animation: dot 1s ease-in-out infinite; }
+      .stage[data-state="thinking"]  .panel .label { background: #0b5f99; }
+      .stage[data-state="acting"]    .panel .label { background: #0f7a45; }
+      .stage[data-state="unsure"]    .panel .label { background: #6b3fb3; }
+      .stage[data-state="error"]     .panel .label { background: #b45309; }
+      @keyframes dot { 50% { opacity: .3 } }
+      .panel .hide { position: absolute; top: 8px; right: 10px; width: 26px; height: 26px; border-radius: 50%;
+        border: 1px solid rgba(255,255,255,.7); background: rgba(255,255,255,.4); color: #0b2540;
+        font-size: 16px; line-height: 1; cursor: pointer; pointer-events: auto; }
+      /* minimized: panel gone, small droplet only; click it to restore */
+      .stage.min .panel { display: none; }
+      .stage.min .vox { width: 40px; height: 40px; cursor: pointer; pointer-events: auto; }
+      .stage.min .vox .q, .stage.min .vox .ring { display: none; }
+      .panel .text  { font-size: 20px; font-weight: 600; margin-top: 8px; color: #06182b; min-height: 1.4em; }
 
-      /* optional typed-command box -- the ONE part of the overlay that accepts clicks */
       .cmd-row { display: flex; gap: 6px; margin-top: 10px; pointer-events: auto; }
       .cmd-row input {
         flex: 1; font: inherit; font-size: 14px; padding: 7px 12px; border-radius: 999px;
-        border: 1px solid rgba(20,80,140,.25); outline: none; min-width: 0;
+        border: 1px solid rgba(255,255,255,.6); background: rgba(255,255,255,.5); outline: none; min-width: 0;
       }
       .cmd-row input:focus { border-color: #2f9be0; }
+
+      .stage[data-state="error"] .panel { border-color: rgba(245,158,11,.85); box-shadow: 0 10px 30px rgba(0,30,60,.25), 0 0 0 3px rgba(245,158,11,.25), inset 0 1px 0 rgba(255,255,255,.9); }
+
+      /* the page's own high-contrast mode (our accessibility command) inverts everything,
+         including us -- #vox-host gets a counter-filter (see JS below) to cancel that, and
+         the panel switches to plain solid colours instead of the liquid-glass look, which
+         would otherwise render as a muddy, half-inverted mess. */
+      .stage[data-hc="1"] .panel {
+        background: #fff; backdrop-filter: none; -webkit-backdrop-filter: none;
+        border: 2px solid #0b2540; box-shadow: 0 4px 12px rgba(0,0,0,.3);
+      }
+      .stage[data-hc="1"] .panel::before,
+      .stage[data-hc="1"] .panel::after { display: none; }
+      .stage[data-hc="1"] .panel .text { color: #000; text-shadow: none; }
     `;
     shadow.appendChild(style);
 
-    const wrap = document.createElement("div");
-    wrap.className = "wrap";
-    wrap.innerHTML = `
+    const stage = document.createElement("div");
+    stage.className = "stage";
+    stage.dataset.state = "idle";
+    stage.innerHTML = `
       <div class="panel" aria-live="polite">
+        <button class="hide" id="hide" aria-label="Hide Vox" title="Hide (or say 'hide Vox')">–</button>
         <div class="label" id="label">Idle</div>
         <div class="text" id="text">Say something like "search for physio clinics"</div>
         <div class="cmd-row">
@@ -131,13 +195,21 @@
       </div>
 
       <div class="vox idle" id="vox" role="img" aria-label="Vox assistant: idle">
-        <svg viewBox="0 0 200 200" aria-hidden="true">
+        <svg viewBox="0 0 200 200" width="110" height="110" aria-hidden="true">
           <defs>
             <radialGradient id="vx-body" cx="38%" cy="32%" r="75%">
-              <stop offset="0%"  stop-color="#e9fbff"/>
-              <stop offset="35%" stop-color="#7fdcff"/>
-              <stop offset="75%" stop-color="#1fa3e0"/>
-              <stop offset="100%" stop-color="#0f6fb0"/>
+              <stop offset="0%"  stop-color="#ffffff" stop-opacity=".55"/>
+              <stop offset="40%" stop-color="#8fe3ff" stop-opacity=".38"/>
+              <stop offset="80%" stop-color="#2aa8e8" stop-opacity=".55"/>
+              <stop offset="100%" stop-color="#0f78c0" stop-opacity=".85"/>
+            </radialGradient>
+            <linearGradient id="vx-ring" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0%" stop-color="#b6f36a"/>
+              <stop offset="100%" stop-color="#3ccf8e"/>
+            </linearGradient>
+            <radialGradient id="vx-glow" cx="50%" cy="85%" r="45%">
+              <stop offset="0%" stop-color="#c8ffe9" stop-opacity=".8"/>
+              <stop offset="100%" stop-color="#c8ffe9" stop-opacity="0"/>
             </radialGradient>
             <linearGradient id="vx-shine" x1="0" y1="0" x2="0" y2="1">
               <stop offset="0%" stop-color="#fff" stop-opacity=".95"/>
@@ -150,11 +222,12 @@
           </defs>
 
           <ellipse cx="100" cy="184" rx="52" ry="9" fill="url(#vx-shadow)"/>
-          <circle class="ring" cx="100" cy="100" r="80" fill="none" stroke="#5cc8ff" stroke-width="4"/>
+          <circle class="ring" cx="100" cy="100" r="80" fill="none" stroke="url(#vx-ring)" stroke-width="5" style="opacity:0"/>
 
           <g class="body-g">
             <path d="M100 18 C 128 48, 172 74, 172 112 A 72 68 0 0 1 28 112 C 28 74, 72 48, 100 18 Z"
-                  fill="url(#vx-body)" stroke="#0e6aa8" stroke-opacity=".35" stroke-width="2"/>
+                  fill="url(#vx-body)" stroke="#ffffff" stroke-opacity=".85" stroke-width="2.5"/>
+            <ellipse cx="100" cy="150" rx="46" ry="22" fill="url(#vx-glow)"/>
             <ellipse cx="74" cy="72" rx="26" ry="15" fill="url(#vx-shine)" transform="rotate(-28 74 72)"/>
             <circle cx="140" cy="140" r="5" fill="#fff" opacity=".55"/>
             <circle cx="128" cy="152" r="2.5" fill="#fff" opacity=".45"/>
@@ -162,50 +235,81 @@
             <g class="eyes">
               <g class="eye l"><ellipse cx="80" cy="108" rx="9" ry="13" fill="#0b2540"/><circle cx="83" cy="102" r="3.2" fill="#fff"/></g>
               <g class="eye r"><ellipse cx="120" cy="108" rx="9" ry="13" fill="#0b2540"/><circle cx="123" cy="102" r="3.2" fill="#fff"/></g>
-              <g class="happy" fill="none" stroke="#0b2540" stroke-width="5" stroke-linecap="round">
+              <g class="happy" fill="none" stroke="#0b2540" stroke-width="5" stroke-linecap="round" style="opacity:0">
                 <path d="M70 112 Q80 98 90 112"/><path d="M110 112 Q120 98 130 112"/>
               </g>
-              <path class="brow" d="M110 86 Q121 78 132 84" fill="none" stroke="#0b2540" stroke-width="4" stroke-linecap="round"/>
+              <g class="worry" fill="none" stroke="#0b2540" stroke-width="4" stroke-linecap="round" style="opacity:0">
+                <path d="M68 92 L88 86"/><path d="M132 92 L112 86"/>
+              </g>
+              <path class="brow" d="M110 86 Q121 78 132 84" fill="none" stroke="#0b2540" stroke-width="4" stroke-linecap="round" style="opacity:0"/>
             </g>
             <ellipse cx="66" cy="128" rx="8" ry="4.5" fill="#ff9fc0" opacity=".55"/>
             <ellipse cx="134" cy="128" rx="8" ry="4.5" fill="#ff9fc0" opacity=".55"/>
-            <path class="sweat" d="M156 70 c 5 8, 8 12, 8 16 a 8 8 0 0 1 -16 0 c 0 -4, 3 -8, 8 -16 z" fill="#bfefff" stroke="#3aa6dc" stroke-width="1.5"/>
+            <path class="sweat s2" d="M150 86 c 3.5 6, 5.5 9, 5.5 12 a 5.5 5.5 0 0 1 -11 0 c 0 -3, 2 -6, 5.5 -12 z" fill="#bfefff" stroke="#3aa6dc" stroke-width="1.2" style="opacity:0"/>
+            <path class="sweat" d="M156 70 c 5 8, 8 12, 8 16 a 8 8 0 0 1 -16 0 c 0 -4, 3 -8, 8 -16 z" fill="#bfefff" stroke="#3aa6dc" stroke-width="1.5" style="opacity:0"/>
           </g>
 
-          <g class="q">
+          <g class="q" style="opacity:0">
             <circle cx="168" cy="38" r="18" fill="#fff" stroke="#7fcdf5" stroke-width="2"/>
             <text x="168" y="46" text-anchor="middle" font-size="24" font-weight="700" fill="#1d7fc0">?</text>
           </g>
         </svg>
       </div>
     `;
-    shadow.appendChild(wrap);
+    shadow.appendChild(stage);
 
     const voxEl = shadow.getElementById("vox");
     const labelEl = shadow.getElementById("label");
     const textEl = shadow.getElementById("text");
     const cmdInput = shadow.getElementById("cmd-input");
+    const hideBtn = shadow.getElementById("hide");
 
-    function setVoxState(state, text, level) {
+    function sendCommand(text) {
+      if (typeof window.voxCommand === "function") window.voxCommand(text);
+    }
+
+    function setMinimized(min) {
+      stage.classList.toggle("min", !!min);
+    }
+
+    function setVoxState(state, text, level, minimized) {
       const meta = STATES[state] || STATES.idle;
       voxEl.className = "vox " + state;
+      stage.dataset.state = state;
       voxEl.setAttribute("aria-label", "Vox assistant: " + state);
       labelEl.textContent = meta[0];
       textEl.textContent = (text !== undefined && text !== null && text !== "") ? text : meta[1];
       if (typeof level === "number") {
         voxEl.style.setProperty("--level", String(Math.max(0, Math.min(1, level))));
       }
+      if (typeof minimized === "boolean") setMinimized(minimized);
     }
+
+    hideBtn.addEventListener("click", () => { setMinimized(true); sendCommand("hide vox"); });
+    voxEl.addEventListener("click", () => {
+      if (stage.classList.contains("min")) { setMinimized(false); sendCommand("show vox"); }
+    });
 
     cmdInput.addEventListener("keydown", (e) => {
       if (e.key !== "Enter") return;
       const value = cmdInput.value.trim();
       if (!value) return;
       cmdInput.value = "";
-      if (typeof window.voxCommand === "function") {
-        window.voxCommand(value);
-      }
+      sendCommand(value);
     });
+
+    // the page's own high-contrast mode (our accessibility command) applies
+    // `filter: invert(1) hue-rotate(180deg)` to <html>, which -- since filter
+    // inherits into descendants regardless of Shadow DOM -- would invert us too.
+    // Applying the identical filter again on the host cancels it out (invert∘invert
+    // = identity, hueRotate(180)∘hueRotate(180) = hueRotate(360) = identity).
+    function syncHighContrast() {
+      const on = !!document.getElementById(HC_STYLE_ID);
+      host.style.filter = on ? "invert(1) hue-rotate(180deg)" : "";
+      stage.dataset.hc = on ? "1" : "0";
+    }
+    syncHighContrast();
+    new MutationObserver(syncHighContrast).observe(document.head, { childList: true });
 
     window.__vox = { set: setVoxState };
     setVoxState("idle");

@@ -8,6 +8,7 @@ which page is "active" (new tab / tab switch). Never raises -- a missing overlay
 """
 import asyncio
 import logging
+import re
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
@@ -19,7 +20,20 @@ logger = logging.getLogger("vox")
 
 OVERLAY_JS = (Path(__file__).parent / "overlay.js").read_text()
 
+_HIDE_RE = re.compile(r"^(hide|minimize|minimise)\s+vox$", re.I)
+_SHOW_RE = re.compile(r"^(show|restore|unhide|maximize|maximise)\s+vox$", re.I)
+
+
+def is_hide_command(text: str) -> bool:
+    return bool(_HIDE_RE.match(text.strip()))
+
+
+def is_show_command(text: str) -> bool:
+    return bool(_SHOW_RE.match(text.strip()))
+
+
 _current: tuple[str, str] = ("idle", "")
+_minimized = False
 _version = 0
 _wired_pages: set[int] = set()
 _on_command: Optional[Callable[[str], Awaitable[None]]] = None
@@ -60,9 +74,30 @@ async def set_then_idle_after(page: Page, state: str, text: str, delay: float = 
     asyncio.ensure_future(_revert())
 
 
+async def hide(page: Page) -> None:
+    """"hide vox" -- minimizes to a small droplet. Remembered across navigation/tabs."""
+    global _minimized
+    _minimized = True
+    await _wire(page)
+    await _apply(page)
+
+
+async def show(page: Page) -> None:
+    """"show vox" -- restores the panel."""
+    global _minimized
+    _minimized = False
+    await _wire(page)
+    await _apply(page)
+
+
 async def show_on(page: Page) -> None:
-    """Call after switching the active tab (new_tab/switch_tab/close_tab) so the
-    overlay on the newly-active page reflects whatever state is already current."""
+    """Call after switching the active tab (new_tab/switch_tab/close_tab/undo) so the
+    overlay on the newly-active page reflects whatever state (and minimized flag) is
+    already current, and bring_to_front()s it so the browser UI actually switches tabs."""
+    try:
+        await page.bring_to_front()
+    except Exception as e:
+        logger.debug("bring_to_front skipped: %s", e)
     await _wire(page)
     await _apply(page)
 
@@ -103,10 +138,22 @@ def describe_action(d: Decision, target_name: str) -> str:
     return f"Doing {d.intent}"
 
 
+def describe_not_found(what: str) -> str:
+    """Error message that says what failed AND suggests a next step."""
+    return f'I couldn\'t find "{what}" on this page. Try saying it differently?'
+
+
+def describe_failure(action: str) -> str:
+    return f"I couldn't {action}. Try saying it differently?"
+
+
 async def _apply(page: Page) -> None:
     state, text = _current
     try:
-        await page.evaluate("([s, t]) => window.__vox && window.__vox.set(s, t)", [state, text])
+        await page.evaluate(
+            "([s, t, m]) => window.__vox && window.__vox.set(s, t, undefined, m)",
+            [state, text, _minimized],
+        )
     except Exception as e:
         logger.debug("overlay apply skipped: %s", e)
 

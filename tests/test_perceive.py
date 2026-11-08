@@ -266,10 +266,35 @@ def test_ordinal_result_second_and_third(results_state):
     assert third.name == "Clinic C - Rehab Center"
 
 
-def test_ordinal_plain_link_still_counts_header_links(results_state):
-    # "second link" (no "result" word) should NOT apply the chrome filter -- it's generic
+def test_ordinal_link_also_excludes_chrome_not_just_result(results_state):
+    # "click the first link" must land on the same real result as "open the first
+    # result" -- the exclusion applies to ordinal "link" too, not just "result"
     first_link = find_deterministic_target(results_state.elements, "click the first link")
-    assert first_link.name == "ExampleSearch"
+    assert first_link.name == "Clinic A - Physiotherapy"
+
+
+def test_ordinal_link_second_and_third_hit_real_results(results_state):
+    second = find_deterministic_target(results_state.elements, "open the second result")
+    third = find_deterministic_target(results_state.elements, "click the third link")
+    assert second.name == "Clinic B - Sports Medicine"
+    assert third.name == "Clinic C - Rehab Center"
+
+
+def test_ordinal_link_excludes_homepage_link_outside_chrome(results_state):
+    # the "Home" breadcrumb isn't inside any header/nav/footer, so only the dedicated
+    # is_homepage_link check (not in_chrome) can be excluding it
+    home = next(e for e in results_state.elements if e.name == "Home")
+    assert home.in_chrome is False
+    assert home.is_homepage_link is True
+    first_link = find_deterministic_target(results_state.elements, "click the first link")
+    assert first_link.id != home.id
+
+
+def test_ordinal_link_excludes_no_text_icon_link_outside_chrome(results_state):
+    icon = next(e for e in results_state.elements if e.role == "link" and e.name == "")
+    assert icon.in_chrome is False
+    first_link = find_deterministic_target(results_state.elements, "click the first link")
+    assert first_link.id != icon.id
 
 
 # ---- the Vox overlay must never block or appear as a page element ------

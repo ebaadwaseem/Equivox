@@ -30,6 +30,7 @@ class Element:
     active: bool = False               # True if this is document.activeElement
     options: list[str] = field(default_factory=list)  # <select> option labels, for matching e.g. "select tuesday"
     in_chrome: bool = False  # inside <header>/<nav>/<footer> -- excluded when counting "results"
+    is_homepage_link: bool = False  # link's href is the current site's own root ("/") -- a logo link
 
 
 @dataclass

@@ -112,6 +112,14 @@
     } catch { return null; }
   }
 
+  function isHomepageLink(el) {
+    if (!el.href) return false;
+    try {
+      const u = new URL(el.href, location.href);
+      return u.hostname === location.hostname && (u.pathname === '/' || u.pathname === '');
+    } catch { return false; }
+  }
+
   function valueOf(el, tag, type) {
     if (tag === 'select') {
       const opt = el.options[el.selectedIndex];
@@ -194,6 +202,7 @@
       value: valueOf(el, tag, type),
       checked: (role === 'checkbox' || role === 'radio') ? !!el.checked : null,
       href_domain: role === 'link' ? hrefDomain(el) : null,
+      is_homepage_link: role === 'link' ? isHomepageLink(el) : false,
       active: el === document.activeElement,
       options: tag === 'select' ? Array.from(el.options).slice(0, 20).map((o) => clean(o.text)) : [],
       // semantic landmarks catch well-built pages; the class/id patterns catch the common

@@ -19,6 +19,15 @@
 </div>
 
 <main>
+  <!-- a homepage-style link OUTSIDE any chrome container -- in_chrome alone must not be
+       the only thing excluding it from ordinal counting, is_homepage_link must too -->
+  <a href="/" class="breadcrumb-home">Home</a>
+  <!-- an icon-only link with no accessible text, also outside chrome, with a href unique
+       from any other link (so the same-destination sibling dedup doesn't remove it for
+       unrelated reasons) -- tests the "no text" ordinal exclusion specifically -->
+  <a href="https://twitter.com/examplesearch" class="icon-link" aria-hidden="false"
+     style="display:inline-block;width:20px;height:20px;"></a>
+
   <!-- each "result" wraps the SAME href in multiple sibling <a> tags: title, icon, url-text --
        mirrors DuckDuckGo's result__a / icon / result__url / result__snippet pattern -->
   <div class="result">
