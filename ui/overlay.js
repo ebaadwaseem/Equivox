@@ -12,7 +12,7 @@
   window.__voxMounting = true;
 
   const STATES = {
-    idle:      ["Idle",          'Say something like "search for physio clinics"'],
+    idle:      ["Idle",          'Say "search for physio clinics" — or click to type'],
     listening: ["Listening…",    ""],
     thinking:  ["Thinking…",     ""],
     acting:    ["Done",          ""],
@@ -118,6 +118,9 @@
       .panel .text {
         font-size: 20px; font-weight: 600; text-shadow: 0 1px 0 rgba(255,255,255,.8); margin-top: 4px; color: #06182b;
         min-height: 1.4em; max-height: 2.8em; line-height: 1.4em; overflow: hidden; position: relative;
+        /* click-through by default (it's just text); only the editable state below
+           opts in, because that's what reveals the typed-command box. */
+        pointer-events: none; cursor: default;
         -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 1.1em, #000 100%);
         mask-image: linear-gradient(to bottom, transparent 0, #000 1.1em, #000 100%);
         transition: opacity .12s ease;
@@ -129,6 +132,11 @@
       }
       .panel .text .w.enter { opacity: 0; transform: translateY(5px); }
       .panel .text .w.tail { opacity: .65; } /* last 2 words of a live partial -- still uncertain */
+
+      /* when the text isn't echoing live speech it doubles as a "type instead" button */
+      .panel .text[data-editable="1"] { pointer-events: auto; cursor: text; }
+      .panel .text[data-editable="1"]:hover { text-decoration: underline dotted rgba(13,79,122,.45); text-underline-offset: 4px; }
+      .panel .text[data-editable="1"]:focus-visible { outline: 2px solid #2f9be0; outline-offset: 3px; border-radius: 6px; }
 
       /* visually hidden but still reachable by screen readers -- carries ONLY finals
          and action results (see updateAriaLive in JS); the visible .text above updates
@@ -165,7 +173,11 @@
       .stage.min .vox .q, .stage.min .vox .ring { display: none; }
       .panel .text  { font-size: 20px; font-weight: 600; text-shadow: 0 1px 0 rgba(255,255,255,.8); margin-top: 4px; color: #06182b; min-height: 1.4em; }
 
-      .cmd-row { display: flex; gap: 6px; margin-top: 10px; pointer-events: auto; }
+      /* Hidden by default: the panel's text IS the live transcript. Clicking the text
+         (when Vox isn't mid-utterance) reveals the input; submitting or clearing it
+         hides the input again. */
+      .cmd-row { display: none; gap: 6px; margin-top: 10px; pointer-events: auto; }
+      .stage[data-editing="1"] .cmd-row { display: flex; }
       .cmd-row input {
         flex: 1; font: inherit; font-size: 14px; padding: 7px 12px; border-radius: 999px;
         border: 1px solid rgba(20,80,140,.35); background: rgba(255,255,255,.88); outline: none; min-width: 0;
@@ -194,6 +206,7 @@
     const stage = document.createElement("div");
     stage.className = "stage";
     stage.dataset.state = "idle";
+    stage.dataset.editing = "0";
     stage.innerHTML = `
       <div class="panel">
         <button class="hide" id="hide" aria-label="Hide Vox" title="Hide (or say 'hide Vox')">–</button>
@@ -280,6 +293,33 @@
     function sendCommand(text) {
       if (typeof window.voxCommand === "function") window.voxCommand(text);
     }
+
+    // --- click-to-type -----------------------------------------------------------------
+    // The text line is the transcript, not a form field. The typed-command input stays
+    // hidden until the user clicks (or focuses + Enter) the text while Vox isn't
+    // echoing a live partial -- clicking mid-utterance would mean "I'm still talking".
+    function openEditor() {
+      if (stage.classList.contains("min")) restore();
+      stage.dataset.editing = "1";
+      requestAnimationFrame(() => cmdInput.focus());
+    }
+
+    function closeEditor() {
+      stage.dataset.editing = "0";
+    }
+
+    textEl.addEventListener("click", () => {
+      if (currentState === "listening" && currentText) return;
+      if (stage.dataset.editing === "1") return;
+      openEditor();
+    });
+    textEl.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        e.stopPropagation();
+        openEditor();
+      }
+    });
 
     const prefersReducedMotion =
       window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -392,7 +432,22 @@
       stage.dataset.state = state;
       voxEl.setAttribute("aria-label", "Vox assistant: " + state);
       labelEl.textContent = meta[0];
-      const shown = (text !== undefined && text !== null && text !== "") ? text : meta[1];
+      let shown = (text !== undefined && text !== null && text !== "") ? text : meta[1];
+      // "thinking" has no placeholder of its own: keep the words already on screen
+      // instead of blanking the panel while the command is being understood.
+      if (!shown && state === "thinking") shown = currentText;
+      // Editable (clickable -> typed-command box) unless the line is echoing a live
+      // partial, in which case it is the transcript and clicks should pass through.
+      const editable = !(state === "listening" && shown);
+      textEl.dataset.editable = editable ? "1" : "0";
+      textEl.title = editable ? "Click to type a command" : "";
+      if (editable) {
+        textEl.setAttribute("role", "button");
+        textEl.setAttribute("tabindex", "0");
+      } else {
+        textEl.removeAttribute("role");
+        textEl.removeAttribute("tabindex");
+      }
 
       if (shown !== currentText) {
         const words = wordsOf(shown);
@@ -463,18 +518,10 @@
       draftBeforeHistory = "";
       cmdHistory.push(value);
       if (cmdHistory.length > 20) cmdHistory.shift();
+      closeEditor(); // back to the live-transcript view; the input was only temporary
       applyFace("listening", value); // optimistic immediate feedback; Python's own
                                       // listening -> thinking -> ... follows right after
       sendCommand(value);
-      // return focus to the command box once the action has had time to run --
-      // unless it moved focus to a real page field (e.g. "type X in the name field"),
-      // which we must never steal focus from.
-      setTimeout(() => {
-        const activeInPage = document.activeElement;
-        const isEmpty = !activeInPage || activeInPage === document.body || activeInPage === document.documentElement;
-        const isOurHost = activeInPage === host;
-        if (isEmpty || isOurHost) cmdInput.focus();
-      }, 1000);
     }
 
     function historyUp() {
@@ -520,10 +567,15 @@
       } else if (e.key === "Escape") {
         cmdInput.value = "";
         historyPos = -1;
+        closeEditor();
         cmdInput.blur();
       }
     }
     cmdInput.addEventListener("keydown", onCmdKeydown, { capture: true });
+    // keep a half-typed draft visible on blur, but collapse the input when it's empty
+    cmdInput.addEventListener("blur", () => {
+      if (!cmdInput.value.trim()) closeEditor();
+    });
     ["keyup", "keypress"].forEach((type) => {
       cmdInput.addEventListener(type, (e) => {
         e.stopPropagation();

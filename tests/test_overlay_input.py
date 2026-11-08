@@ -150,6 +150,79 @@ def test_binding_survives_navigation_and_new_tab():
     assert from_new_tab == "go back"
 
 
+def test_input_is_hidden_until_the_text_is_clicked():
+    """The panel text is the live transcript; the typed-command input only appears
+    when clicked (and only when Vox isn't echoing a live partial)."""
+    async def scenario():
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            ctx = await browser.new_context()
+            queue: asyncio.Queue = asyncio.Queue()
+
+            def on_command(source, text):
+                text = (text or "").strip()
+                if text:
+                    queue.put_nowait(text)
+
+            await ctx.expose_binding("voxCommand", on_command)
+            await vox.install(ctx)
+            page = await ctx.new_page()
+            await page.goto(FORM_FIXTURE)
+            await page.wait_for_selector("#vox-host", timeout=3000)
+
+            async def read():
+                return await page.evaluate(
+                    """() => {
+                        const sr = document.getElementById('vox-host').shadowRoot;
+                        const row = sr.querySelector('.cmd-row');
+                        const input = sr.querySelector('#cmd-input');
+                        return {
+                            editing: sr.querySelector('.stage').dataset.editing,
+                            visible: getComputedStyle(row).display !== 'none',
+                            focused: sr.activeElement === input,
+                            text: sr.querySelector('#text').textContent,
+                        };
+                    }"""
+                )
+
+            async def click_text():
+                await page.evaluate(
+                    "() => document.getElementById('vox-host').shadowRoot.querySelector('#text').click()"
+                )
+                await page.wait_for_timeout(50)
+
+            initial = await read()
+
+            # live partial -> text updates, but the input stays hidden and unclickable
+            await vox.set(page, "listening", "search for physio clinics in edmonton")
+            await page.wait_for_timeout(150)
+            live = await read()
+            await click_text()
+            click_during_speech = await read()
+
+            # nothing being said -> clicking the text reveals the input
+            await vox.set(page, "idle")
+            await page.wait_for_timeout(150)
+            await click_text()
+            opened = await read()
+
+            await _submit_via_overlay(page, "scroll down")
+            await asyncio.wait_for(queue.get(), timeout=3)
+            await page.wait_for_timeout(50)
+            after_submit = await read()
+
+            await browser.close()
+            return initial, live, click_during_speech, opened, after_submit
+
+    initial, live, click_during_speech, opened, after_submit = _run(scenario())
+    assert initial["visible"] is False and initial["editing"] == "0"
+    assert "physio" in live["text"]  # the words spoken are on screen
+    assert live["visible"] is False
+    assert click_during_speech["editing"] == "0" and click_during_speech["visible"] is False
+    assert opened["visible"] is True and opened["focused"] is True
+    assert after_submit["visible"] is False and after_submit["editing"] == "0"
+
+
 def test_empty_and_whitespace_input_is_ignored():
     async def scenario():
         async with async_playwright() as p:

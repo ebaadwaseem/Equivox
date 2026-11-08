@@ -234,6 +234,11 @@ async def main() -> None:
 
             if t.id is not None:
                 if early_commit.already_committed(t.id):
+                    # The action ran on an earlier partial; this final's text was still
+                    # echoed to the overlay by the input loop, so settle it back to idle
+                    # instead of leaving the panel pinned on "Listening…" forever.
+                    if t.is_final and vox.current_state() == "listening":
+                        await vox.set(active_page, "idle")
                     return  # already acted on this utterance via early commit -- ignore
                 first_partial_ts.setdefault(t.id, t_start)
                 if t.is_final:
@@ -329,7 +334,11 @@ async def main() -> None:
                     return
                 pending = None  # fall through and treat this as a new command
 
-            await vox.set(active_page, "thinking")
+            # Only switch to "thinking" once the utterance is final, and keep its words
+            # on screen -- doing this per partial made the panel strobe between
+            # Listening/Thinking (and blank the transcript) while the user was talking.
+            if t.is_final:
+                await vox.set(active_page, "thinking", t.text)
             state = await get_page_state(active_page)
             cands = shortlist(state, t.text)
             viewport = active_page.viewport_size
@@ -362,14 +371,14 @@ async def main() -> None:
             )
 
             if outcome == "IGNORE":
-                await vox.set(active_page, "idle")
+                if t.is_final:
+                    await vox.set(active_page, "idle")
                 return
             if outcome == "WAIT":
-                return  # still "thinking" from above; nothing new to show yet
+                return  # still Listening/Thinking from above; nothing new to show yet
             if outcome == "PREVIEW":
                 if d.target_id:
                     await highlight(active_page, d.target_id)
-                    await vox.set(active_page, "thinking", f"Looking for {target_name}…")
                 return
             if outcome == "CONFIRM":
                 if d.target_id:
@@ -455,6 +464,14 @@ async def main() -> None:
         try:
             while True:
                 t = await input_queue.get()
+                # Echo mic partials to the overlay immediately, outside the decision
+                # pipeline: Scheduler cancels the previous in-flight handler on every
+                # new partial, so a cancelled handle() never reached vox.set() and the
+                # live transcript would visibly lag/stall exactly when speech is fastest.
+                # Finals still render in handle(), and typed input (id=None) keeps its
+                # optimistic display from the overlay itself.
+                if t.id is not None and not t.is_final:
+                    await vox.set(active_page, "listening", t.text)
                 sched.submit(t)
         finally:
             for task in tasks:

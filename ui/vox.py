@@ -179,6 +179,12 @@ def describe_failure(action: str) -> str:
     return f"I couldn't {action}. Try saying it differently?"
 
 
+def current_state() -> str:
+    """The state currently shown on the overlay (e.g. "listening"), for callers that
+    need to know whether a live transcript is still on screen."""
+    return _current[0]
+
+
 async def _apply(page: Page) -> None:
     state, text = _current
     try:
