@@ -44,11 +44,7 @@ INTENT_CRITERIA = {
     "none": "not a browser command at all",
 }
 
-_SCROLL_PX = {
-    "small_up": -200, "small_down": 200,
-    "medium_up": -600, "medium_down": 600,
-    "large_up": -1200, "large_down": 1200,
-}
+_SCROLL_FRACTION = {"small": 0.3, "medium": 0.8, "large": 1.0}
 
 
 async def decide(
@@ -137,8 +133,21 @@ async def decide(
     confidence = is_command_p if target_id is None else min(is_command_p, target_conf)
 
     text_value = _extract_text_for_intent(intent, transcript)
-    scroll_amount = 0
     destructive = looks_destructive(target_name)
+
+    # scroll_amount is a signed FRACTION of the scroll container's visible height
+    # (direction always read straight from the transcript, never guessed by Jev --
+    # "up"/"down" is unambiguous text, no reason to spend a model call on it).
+    scroll_to: Optional[str] = None
+    scroll_amount = 0.0
+    scroll_fraction_explicit = False
+    if intent == "scroll":
+        scroll_to = spans.extract_scroll_to(transcript)
+        if scroll_to is None:
+            sign = -1 if spans.extract_scroll_direction(transcript) == "up" else 1
+            explicit_fraction = spans.extract_scroll_fraction(transcript)
+            scroll_fraction_explicit = explicit_fraction is not None
+            scroll_amount = sign * (explicit_fraction if explicit_fraction is not None else spans.DEFAULT_SCROLL_FRACTION)
 
     about_to_commit = is_final and complete_p >= 0.5 and (target_id or intent in {"scroll", "navigate", "search", "back", "forward"})
     if about_to_commit:
@@ -153,14 +162,15 @@ async def decide(
                     "out normal form fields."
                 ),
             }
-        if intent == "scroll":
+        # only ask when neither an explicit magnitude word ("a bit"/"a lot"/...) nor an
+        # explicit top/bottom target was found -- those always win over Jev's guess.
+        if intent == "scroll" and scroll_to is None and not scroll_fraction_explicit:
             extra_questions["scroll_amount"] = {
                 "type": "choice",
-                "instructions": "How far should the page scroll, and in which direction?",
+                "instructions": "How far should the page scroll?",
                 "criteria": {
-                    "small_up": "a small amount up", "small_down": "a small amount down",
-                    "medium_up": "a medium amount up", "medium_down": "a medium amount down",
-                    "large_up": "a large amount up", "large_down": "a large amount down",
+                    "small": "a small amount", "medium": "a normal amount (default)",
+                    "large": "a large amount, a full page",
                 },
             }
         if extra_questions:
@@ -173,10 +183,8 @@ async def decide(
                     destructive = destructive or jev.noul(answers2, "destructive") >= 0.5
                 if "scroll_amount" in extra_questions:
                     scroll_choice, _, _ = jev.choice(answers2, "scroll_amount")
-                    scroll_amount = _SCROLL_PX.get(scroll_choice, 600)
-
-    if intent == "scroll" and scroll_amount == 0:
-        scroll_amount = -600 if "up" in transcript.lower() else 600
+                    fraction = _SCROLL_FRACTION.get(scroll_choice, spans.DEFAULT_SCROLL_FRACTION)
+                    scroll_amount = (-1 if scroll_amount < 0 else 1) * fraction
 
     return Decision(
         is_command=is_command_p >= 0.5,
@@ -184,6 +192,7 @@ async def decide(
         target_id=target_id,
         text=text_value,
         scroll_amount=scroll_amount,
+        scroll_to=scroll_to,
         complete=complete_p >= 0.5,
         confidence=confidence,
         destructive=destructive,
@@ -222,7 +231,12 @@ def _keyword_fallback(transcript: str, elements: list[Element]) -> Decision:
     if t in ("forward", "go forward"):
         return Decision(True, "forward")
     if t.startswith("scroll"):
-        return Decision(True, "scroll", scroll_amount=-600 if "up" in t else 600)
+        scroll_to = spans.extract_scroll_to(transcript)
+        if scroll_to:
+            return Decision(True, "scroll", scroll_to=scroll_to)
+        sign = -1 if spans.extract_scroll_direction(transcript) == "up" else 1
+        fraction = spans.extract_scroll_fraction(transcript) or spans.DEFAULT_SCROLL_FRACTION
+        return Decision(True, "scroll", scroll_amount=sign * fraction)
     if "tab" in t:
         if t in ("close tab", "close this tab", "close the tab"):
             return Decision(True, "close_tab")

@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 
 from audio.transcriber import TypedTranscriber
-from backend import jev, policy
+from backend import jev, policy, spans
 from backend.model import decide
 from backend.scheduler import Scheduler
 from executor import act, undo
@@ -81,6 +81,7 @@ async def main() -> None:
         recent_actions: list[str] = []
         checkpoints: list[undo.Checkpoint] = []  # for smart "go back"/"undo"
         last_command_ts = 0.0  # when the most recent user command STARTED executing
+        last_scroll: Optional[Decision] = None  # for "keep scrolling"/"more"/"again"
         pending: dict | None = None  # {"kind": "confirm"|"disambiguate"|"undo_disambiguate", ...}
 
         async def on_new_page(new_page) -> None:
@@ -112,7 +113,7 @@ async def main() -> None:
             await undo.push_checkpoint(checkpoints, active_page)
 
         async def run_action(d: Decision, target_name: str = "") -> None:
-            nonlocal active_page
+            nonlocal active_page, last_scroll
             await mark_user_command()
 
             if d.intent in TAB_INTENTS:
@@ -148,6 +149,16 @@ async def main() -> None:
                 elif result.startswith("could not find") or result.startswith("skipped"):
                     await vox.set_then_idle_after(
                         active_page, "error", vox.describe_failure(d.intent.replace("_", " ")), delay=ERROR_REVERT_S)
+                elif d.intent == "scroll":
+                    # executor.act.scroll()'s own result text knows whether it actually
+                    # moved, hit an edge, or reached an explicit top/bottom target --
+                    # describe_action() can only guess from the Decision alone.
+                    if result.startswith("Already"):
+                        await vox.set_then_idle_after(active_page, "error", result, delay=ERROR_REVERT_S)
+                    else:
+                        await vox.set_then_idle_after(active_page, "acting", result)
+                    if d.scroll_to is None:
+                        last_scroll = d
                 else:
                     await vox.set_then_idle_after(active_page, "acting", vox.describe_action(d, target_name))
             except Exception:
@@ -234,6 +245,11 @@ async def main() -> None:
                 return
             if text_norm in UNDO_PHRASES:
                 await resolve_and_execute_undo()
+                pending = None
+                return
+            if spans.is_scroll_repeat(t.text):
+                repeat_decision = last_scroll or Decision(True, "scroll", scroll_amount=spans.DEFAULT_SCROLL_FRACTION)
+                await run_action(repeat_decision)
                 pending = None
                 return
 

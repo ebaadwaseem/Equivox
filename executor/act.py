@@ -20,7 +20,7 @@ async def execute(page: Page, d: Decision) -> str:
         case "select" if sel:
             await page.locator(sel).first.select_option(label=d.text or "", timeout=3000)
         case "scroll":
-            await page.mouse.wheel(0, d.scroll_amount or 600)
+            return await scroll(page, d.scroll_amount, d.scroll_to)
         case "back":
             await page.go_back()
         case "forward":
@@ -39,6 +39,109 @@ async def execute(page: Page, d: Decision) -> str:
         case _:
             return f"skipped ({d.intent}, target={d.target_id})"
     return f"did {d.intent} {d.target_id or d.text or ''}".strip()
+
+
+_SCROLL_JS = """
+([fraction, scrollTo, behavior]) => {
+  const HOST_ID = 'vox-host';
+
+  function findContainer() {
+    const cx = innerWidth / 2, cy = innerHeight / 2;
+    const stack = document.elementsFromPoint(cx, cy);
+    let start = null;
+    for (const el of stack) {
+      if (el.id === HOST_ID || (el.closest && el.closest('#' + HOST_ID))) continue;
+      start = el;
+      break;
+    }
+    if (start) {
+      let el = start;
+      while (el && el !== document.documentElement) {
+        const style = getComputedStyle(el);
+        if (el.scrollHeight > el.clientHeight + 10 && (style.overflowY === 'auto' || style.overflowY === 'scroll')) {
+          return el;
+        }
+        el = el.parentElement;
+      }
+    }
+    return document.scrollingElement || document.documentElement;
+  }
+
+  const container = findContainer();
+  const maxScroll = Math.max(0, container.scrollHeight - container.clientHeight);
+  const before = container.scrollTop;
+
+  let target, direction;
+  if (scrollTo === 'top') { target = 0; direction = 'up'; }
+  else if (scrollTo === 'bottom') { target = maxScroll; direction = 'down'; }
+  else {
+    direction = fraction < 0 ? 'up' : 'down';
+    target = before + fraction * container.clientHeight;
+  }
+  target = Math.max(0, Math.min(maxScroll, target));
+
+  if (Math.abs(target - before) < 1) {
+    // nothing will move -- report it instantly instead of waiting on a scroll that
+    // isn't going to happen
+    return { moved: false, direction, atTop: before <= 1, atBottom: before >= maxScroll - 1 };
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      const after = container.scrollTop;
+      resolve({
+        moved: Math.abs(after - before) > 1,
+        direction,
+        atTop: after <= 1,
+        atBottom: after >= maxScroll - 1,
+      });
+    };
+    window.addEventListener('scrollend', finish, { once: true });
+    if (container !== document.scrollingElement && container.addEventListener) {
+      container.addEventListener('scrollend', finish, { once: true });
+    }
+    // fallback if scrollend never fires at all -- generous on purpose: a short
+    // ~500ms single-viewport scroll finishes (and fires scrollend) well before
+    // this anyway, but a large jump (e.g. "to the bottom" on a long page) can take
+    // close to a second to animate smoothly, and firing early would report the
+    // scroll's MID-ANIMATION position as final.
+    setTimeout(finish, 2500);
+    if (typeof container.scrollTo === 'function') {
+      container.scrollTo({ top: target, behavior });
+    } else {
+      container.scrollTop = target;
+      finish();
+    }
+  });
+}
+"""
+
+
+async def scroll(page: Page, fraction: float, scroll_to: str | None) -> str:
+    """Finds the right scroll container (an inner scrollable element under the
+    viewport centre if one exists -- Gmail, Docs, Discord and similar app layouts
+    scroll an inner div, not the window -- else the document), scrolls it smoothly
+    by a fraction of ITS OWN visible height (or straight to the top/bottom), and
+    waits for the scroll to actually finish before returning, so perception's next
+    snapshot sees the page in its post-scroll state.
+    """
+    try:
+        reduced_motion = await page.evaluate("() => matchMedia('(prefers-reduced-motion: reduce)').matches")
+    except Exception:
+        reduced_motion = False
+    behavior = "instant" if reduced_motion else "smooth"
+    result = await page.evaluate(_SCROLL_JS, [fraction, scroll_to, behavior])
+
+    if scroll_to == "top":
+        return "Top of page"
+    if scroll_to == "bottom":
+        return "Bottom of page"
+    if not result["moved"]:
+        return "Already at the top" if result["direction"] == "up" else "Already at the bottom"
+    return f"Scrolling {result['direction']}"
 
 
 async def highlight(page: Page, target_id: str) -> None:

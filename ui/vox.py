@@ -128,6 +128,13 @@ def describe_action(d: Decision, target_name: str) -> str:
     if d.intent == "select":
         return f'Selecting "{d.text}" in "{name}"'
     if d.intent == "scroll":
+        # main.py actually uses executor.act.scroll()'s own result text instead of this
+        # (it knows whether the scroll really moved, hit an edge, etc.) -- kept correct
+        # here too in case this is ever the only text available (e.g. a PREVIEW).
+        if d.scroll_to == "top":
+            return "Scrolling to the top"
+        if d.scroll_to == "bottom":
+            return "Scrolling to the bottom"
         return f'Scrolling {"up" if d.scroll_amount < 0 else "down"}'
     if d.intent == "navigate":
         return f"Going to {d.text}"

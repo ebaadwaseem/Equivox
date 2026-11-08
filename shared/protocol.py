@@ -61,10 +61,14 @@ class Decision:
     intent: Intent
     target_id: Optional[str] = None   # Element.id
     text: Optional[str] = None        # text to type / search query / url / option label
-    scroll_amount: int = 0            # pixels, negative = up
+    # fraction of the scroll container's visible height, negative = up (e.g. -0.8 = up
+    # 80% of a page). Was pixels (int); widened to float since the actual pixel amount
+    # depends on whichever container ends up scrolling, only known at execute() time.
+    scroll_amount: float = 0
     complete: bool = True             # is the command finished being spoken?
     confidence: float = 1.0
     # optional extras (added by Person 3, all default so old code/tests still work)
     destructive: bool = False         # irreversible-looking action (delete, submit) -> ask to confirm
     ambiguous: bool = False           # top-2 target candidates are too close to call automatically
     target_confidence: float = 1.0    # how sure the model is about target_id specifically
+    scroll_to: Optional[str] = None   # "top" | "bottom" -- overrides scroll_amount when set

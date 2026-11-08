@@ -1,13 +1,17 @@
 from backend.spans import (
+    DEFAULT_SCROLL_FRACTION,
     extract_accessibility_action,
     extract_find_text,
     extract_new_tab_url,
-    extract_scroll_amount,
+    extract_scroll_direction,
+    extract_scroll_fraction,
+    extract_scroll_to,
     extract_search_query,
     extract_select_value,
     extract_tab_switch_query,
     extract_type_text,
     extract_url,
+    is_scroll_repeat,
 )
 
 
@@ -51,18 +55,69 @@ def test_extract_select_value_choose_synonym():
     assert extract_select_value("choose Wednesday") == "Wednesday"
 
 
-def test_extract_scroll_amount_down_medium():
-    assert extract_scroll_amount("scroll down") > 0
+def test_extract_scroll_direction_down_default():
+    assert extract_scroll_direction("scroll down") == "down"
 
 
-def test_extract_scroll_amount_up_is_negative():
-    assert extract_scroll_amount("scroll up a bit", size="small") < 0
+def test_extract_scroll_direction_up():
+    assert extract_scroll_direction("scroll up a bit") == "up"
 
 
-def test_extract_scroll_amount_large_bigger_than_small():
-    small = abs(extract_scroll_amount("scroll down", size="small"))
-    large = abs(extract_scroll_amount("scroll down", size="large"))
-    assert large > small
+def test_extract_scroll_direction_no_keyword_defaults_down():
+    assert extract_scroll_direction("scroll") == "down"
+
+
+def test_extract_scroll_fraction_bit_words():
+    for phrase in ("scroll down a bit", "a little", "slightly down", "a tad"):
+        assert extract_scroll_fraction(phrase) == 0.3
+
+
+def test_extract_scroll_fraction_lot_words():
+    for phrase in ("a lot", "a full page", "way down", "way up"):
+        assert extract_scroll_fraction(phrase) == 1.0
+
+
+def test_extract_scroll_fraction_half_words():
+    assert extract_scroll_fraction("half a page") == 0.5
+    assert extract_scroll_fraction("scroll down halfway") == 0.5
+
+
+def test_extract_scroll_fraction_none_when_no_magnitude_word():
+    assert extract_scroll_fraction("scroll down") is None
+
+
+def test_extract_scroll_to_top():
+    assert extract_scroll_to("scroll to the top") == "top"
+
+
+def test_extract_scroll_to_bottom():
+    assert extract_scroll_to("scroll to the bottom") == "bottom"
+
+
+def test_extract_scroll_to_all_the_way_down():
+    assert extract_scroll_to("scroll all the way down") == "bottom"
+
+
+def test_extract_scroll_to_all_the_way_up():
+    assert extract_scroll_to("scroll all the way up") == "top"
+
+
+def test_extract_scroll_to_none_for_plain_scroll():
+    assert extract_scroll_to("scroll down") is None
+
+
+def test_is_scroll_repeat_phrases():
+    for phrase in ("keep scrolling", "more", "again", "scroll more"):
+        assert is_scroll_repeat(phrase) is True
+
+
+def test_is_scroll_repeat_rejects_unrelated():
+    assert is_scroll_repeat("scroll down") is False
+    assert is_scroll_repeat("click more info") is False
+
+
+def test_default_scroll_fraction_is_point_eight():
+    assert DEFAULT_SCROLL_FRACTION == 0.8
 
 
 def test_extract_url_site_alias():

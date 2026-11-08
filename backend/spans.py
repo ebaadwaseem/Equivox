@@ -58,17 +58,54 @@ def extract_select_value(transcript: str) -> Optional[str]:
     return m.group(1).strip() if m else None
 
 
-_SCROLL_UNIT = 600  # px per "medium" scroll
+# ---- scroll: amount is a FRACTION of the scroll container's visible height, not
+# pixels -- the container itself isn't even known until execute() time, since many
+# sites scroll an inner element (Gmail, Docs, Discord), not the window.
+
+DEFAULT_SCROLL_FRACTION = 0.8  # "scroll down" with no qualifier -- like Page Down
+
+_SCROLL_BIT_WORDS = ("a bit", "a little", "slightly", "a tad")
+_SCROLL_HALF_WORDS = ("half a page", "halfway")
+_SCROLL_LOT_WORDS = ("a lot", "a page", "full page", "way down", "way up")
 
 
-def extract_scroll_amount(transcript: str, size: str = "medium") -> int:
-    """Direction from the transcript, magnitude from `size` ("small"/"medium"/"large")."""
+def extract_scroll_fraction(transcript: str) -> Optional[float]:
+    """Explicit magnitude words -> a fraction of the container's visible height.
+    None if the transcript doesn't name a magnitude (caller should fall back to
+    DEFAULT_SCROLL_FRACTION, optionally refined by Jev's small/medium/large)."""
     t = transcript.lower()
-    direction = -1 if "up" in t else 1
-    magnitude = {"small": _SCROLL_UNIT // 3, "medium": _SCROLL_UNIT, "large": _SCROLL_UNIT * 2}.get(
-        size, _SCROLL_UNIT
-    )
-    return direction * magnitude
+    if any(w in t for w in _SCROLL_HALF_WORDS):
+        return 0.5
+    if any(w in t for w in _SCROLL_BIT_WORDS):
+        return 0.3
+    if any(w in t for w in _SCROLL_LOT_WORDS):
+        return 1.0
+    return None
+
+
+def extract_scroll_direction(transcript: str) -> str:
+    """"up" or "down" -- always read straight from the words, regardless of magnitude."""
+    return "up" if "up" in transcript.lower() else "down"
+
+
+def extract_scroll_to(transcript: str) -> Optional[str]:
+    """"to the top"/"to the bottom"/"all the way [up/down]" -> "top"/"bottom"."""
+    t = transcript.lower()
+    if "to the top" in t:
+        return "top"
+    if "to the bottom" in t:
+        return "bottom"
+    if "all the way" in t:
+        return "top" if "up" in t else "bottom"
+    return None
+
+
+_SCROLL_REPEAT_PHRASES = {"keep scrolling", "more", "again", "scroll more"}
+
+
+def is_scroll_repeat(transcript: str) -> bool:
+    """"keep scrolling"/"more"/"again"/"scroll more" -> redo the last scroll."""
+    return transcript.strip().lower() in _SCROLL_REPEAT_PHRASES
 
 
 # ---- find: voice Ctrl+F -- scroll to/highlight arbitrary page TEXT, not an element ------
