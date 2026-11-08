@@ -11,6 +11,7 @@ from shared.protocol import Element, PageState
 
 FORM_FIXTURE = (Path(__file__).parent / "fixtures" / "pages" / "form.html").resolve().as_uri()
 RESULTS_FIXTURE = (Path(__file__).parent / "fixtures" / "pages" / "results.html").resolve().as_uri()
+SEARCH_FIXTURE = (Path(__file__).parent / "fixtures" / "pages" / "search.html").resolve().as_uri()
 OVERLAY_JS = (Path(__file__).parent.parent / "ui" / "overlay.js").read_text()
 
 
@@ -338,3 +339,34 @@ def test_corner_button_found_despite_overlay(form_state_with_overlay):
 def test_corner_button_still_clickable_through_overlay(form_state_with_overlay):
     _, clicked = form_state_with_overlay
     assert clicked is True
+
+
+# ---- the overlay's own typed-command box must never be a shortlist/match target --
+
+async def _load_search_state_with_overlay() -> PageState:
+    async with async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page()
+        await page.add_init_script(OVERLAY_JS)
+        await page.goto(SEARCH_FIXTURE)
+        await page.wait_for_selector("#vox-host", timeout=3000, state="attached")
+        state = await get_page_state(page)
+        await browser.close()
+        return state
+
+
+@pytest.fixture(scope="module")
+def search_state_with_overlay() -> PageState:
+    return asyncio.run(_load_search_state_with_overlay())
+
+
+def test_overlay_cmd_input_not_extracted_as_element(search_state_with_overlay):
+    assert all(e.id != "cmd-input" for e in search_state_with_overlay.elements)
+    assert not any("type a command" in (e.name or "").lower() for e in search_state_with_overlay.elements)
+
+
+def test_type_in_search_box_targets_the_pages_box_not_the_overlay(search_state_with_overlay):
+    cands = shortlist(search_state_with_overlay, "type hello in the search box")
+    assert cands[0].role == "textbox"
+    assert cands[0].input_type == "search"
+    assert cands[0].name == "Search"

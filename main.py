@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import time
+from typing import Optional
 
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
@@ -16,7 +17,7 @@ from backend.model import decide
 from backend.scheduler import Scheduler
 from executor import act, undo
 from executor.act import execute, highlight
-from perception.perceive import get_page_state, shortlist, to_prompt_text
+from perception.perceive import ORDINALS, get_page_state, shortlist, to_prompt_text
 from shared.protocol import Decision, Element, Transcript
 from ui import vox
 
@@ -40,6 +41,23 @@ ERROR_REVERT_S = 4.0
 
 def _target_name(d: Decision, cands: list[Element]) -> str:
     return next((e.name for e in cands if e.id == d.target_id), d.target_id or "")
+
+
+def _parse_ordinal_reply(text: str, count: int) -> Optional[int]:
+    """"2", "option 2", "the second one", "second" -> 2 (1-indexed), for replying to a
+    numbered confirm/disambiguate prompt from either the terminal or the Vox panel."""
+    for w in (w.strip(".,!?") for w in text.strip().lower().split()):
+        if w.isdigit():
+            n = int(w)
+            if 1 <= n <= count:
+                return n
+        elif w in ORDINALS:
+            n = ORDINALS[w]
+            if n == -1:  # "last"
+                return count
+            if 1 <= n <= count:
+                return n
+    return None
 
 
 async def main() -> None:
@@ -184,9 +202,6 @@ async def main() -> None:
             await vox.set(active_page, "unsure", f"Did you mean: {options}")
             pending = {"kind": "undo_disambiguate", "candidates": candidates}
 
-        async def on_vox_command(text: str) -> None:
-            sched.submit(Transcript(text=text, is_final=True))
-
         async def handle(t: Transcript) -> None:
             nonlocal pending, active_page
             t_start = time.perf_counter()
@@ -235,26 +250,24 @@ async def main() -> None:
                 pending = None  # user moved on; fall through and treat this as a new command
 
             if pending and pending["kind"] == "disambiguate":
-                if text_norm.isdigit():
-                    idx = int(text_norm) - 1
-                    candidates = pending["candidates"]
-                    if 0 <= idx < len(candidates):
-                        d = pending["decision"]
-                        d.target_id = candidates[idx].id
-                        d.ambiguous = False
-                        pending = None
-                        await run_action(d, candidates[idx].name)
-                        return
+                candidates = pending["candidates"]
+                n = _parse_ordinal_reply(t.text, len(candidates))
+                if n is not None:
+                    d = pending["decision"]
+                    d.target_id = candidates[n - 1].id
+                    d.ambiguous = False
+                    pending = None
+                    await run_action(d, candidates[n - 1].name)
+                    return
                 pending = None  # fall through and treat this as a new command
 
             if pending and pending["kind"] == "undo_disambiguate":
-                if text_norm.isdigit():
-                    idx = int(text_norm) - 1
-                    candidates = pending["candidates"]
-                    if 0 <= idx < len(candidates):
-                        pending = None
-                        await go_back_to(candidates[idx])
-                        return
+                candidates = pending["candidates"]
+                n = _parse_ordinal_reply(t.text, len(candidates))
+                if n is not None:
+                    pending = None
+                    await go_back_to(candidates[n - 1])
+                    return
                 pending = None  # fall through and treat this as a new command
 
             await vox.set(active_page, "thinking")
@@ -306,10 +319,25 @@ async def main() -> None:
                 await run_action(d, target_name)
 
         sched = Scheduler(handle)
+
+        # ONE input queue, multiple sources (terminal, the Vox panel's typed-command
+        # box, a real mic later) -- all of them just produce Transcripts here; a single
+        # consumer loop below drains the queue into the scheduler.
+        input_queue: asyncio.Queue[Transcript] = asyncio.Queue()
+
+        def on_vox_command(source, text: str) -> None:
+            # must return immediately -- just enqueue, never await anything slow here.
+            text = (text or "").strip()
+            if text:
+                input_queue.put_nowait(Transcript(text=text, is_final=True))
+
+        # expose_binding is registered on the CONTEXT (not a page), so it applies to
+        # every current/future tab and survives navigation with no per-page plumbing.
+        await ctx.expose_binding("voxCommand", on_vox_command)
         # install the overlay's init-script BEFORE creating/navigating the first page --
         # add_init_script only affects pages/navigations registered after this point, so
         # doing this after the initial page.goto() would miss the first page entirely.
-        await vox.install(ctx, on_command=on_vox_command)
+        await vox.install(ctx)
 
         if cdp:
             active_page = ctx.pages[0] if ctx.pages else await ctx.new_page()
@@ -317,11 +345,17 @@ async def main() -> None:
             active_page = await ctx.new_page()
             await active_page.goto(START_URL)
 
-        try:
+        async def feed_terminal() -> None:
             async for t in TypedTranscriber().stream():
+                input_queue.put_nowait(t)
+
+        terminal_task = asyncio.create_task(feed_terminal())
+        try:
+            while True:
+                t = await input_queue.get()
                 sched.submit(t)
-                await asyncio.sleep(0)
         finally:
+            terminal_task.cancel()
             await jev.aclose()
 
 

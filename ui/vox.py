@@ -10,7 +10,6 @@ import asyncio
 import logging
 import re
 from pathlib import Path
-from typing import Awaitable, Callable, Optional
 
 from playwright.async_api import Page
 
@@ -54,15 +53,14 @@ _current: tuple[str, str] = ("idle", "")
 _minimized = False
 _version = 0
 _wired_pages: set[int] = set()
-_on_command: Optional[Callable[[str], Awaitable[None]]] = None
 
 
-async def install(context, on_command: Optional[Callable[[str], Awaitable[None]]] = None) -> None:
+async def install(context) -> None:
     """Call once per BrowserContext: injects the overlay into every current/future page.
-    If `on_command` is given, the overlay's typed-command box will call it with the
-    text the user typed (wired via page.expose_function, per page)."""
-    global _on_command
-    _on_command = on_command
+    The overlay's typed-command box calls window.voxCommand(text) directly -- main.py
+    wires that up itself via context.expose_binding(), once, at the context level (so
+    it works on every tab and survives navigation without any per-page plumbing here).
+    """
     try:
         await context.add_init_script(OVERLAY_JS)
     except Exception as e:
@@ -190,15 +188,3 @@ async def _wire(page: Page) -> None:
 
     page.on("load", _on_load)
     page.on("framenavigated", _on_framenavigated)
-
-    if _on_command is not None:
-        async def _handle_command(text: str) -> None:
-            try:
-                await _on_command(text)
-            except Exception as e:
-                logger.warning("vox command handler failed: %s", e)
-
-        try:
-            await page.expose_function("voxCommand", _handle_command)
-        except Exception as e:
-            logger.debug("expose_function skipped: %s", e)

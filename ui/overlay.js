@@ -135,9 +135,12 @@
       .cmd-row { display: flex; gap: 6px; margin-top: 10px; pointer-events: auto; }
       .cmd-row input {
         flex: 1; font: inherit; font-size: 14px; padding: 7px 12px; border-radius: 999px;
-        border: 1px solid rgba(255,255,255,.6); background: rgba(255,255,255,.5); outline: none; min-width: 0;
+        border: 1px solid rgba(20,80,140,.35); background: rgba(255,255,255,.88); outline: none; min-width: 0;
+        color: #06182b; /* explicit dark text -- shadow DOM inherits color from the host
+                            page's computed style otherwise, which isn't guaranteed readable */
       }
-      .cmd-row input:focus { border-color: #2f9be0; }
+      .cmd-row input::placeholder { color: #4b5563; opacity: 1; } /* ~7:1 contrast on the input's own background */
+      .cmd-row input:focus { border-color: #2f9be0; outline: 2px solid #2f9be0; outline-offset: 1px; }
 
       .stage[data-state="error"] .panel { border-color: rgba(245,158,11,.85); box-shadow: 0 10px 30px rgba(0,30,60,.25), 0 0 0 3px rgba(245,158,11,.25), inset 0 1px 0 rgba(255,255,255,.9); }
 
@@ -290,12 +293,85 @@
       if (stage.classList.contains("min")) { restore(); sendCommand("show vox"); }
     });
 
-    cmdInput.addEventListener("keydown", (e) => {
-      if (e.key !== "Enter") return;
+    // --- typed-command input: history, submit, and isolating keystrokes from the page ---
+    let cmdHistory = [];       // last ~20 submitted commands, most recent last
+    let historyPos = -1;       // -1 = not browsing history
+    let draftBeforeHistory = "";
+
+    function submitCommand() {
       const value = cmdInput.value.trim();
       if (!value) return;
       cmdInput.value = "";
+      historyPos = -1;
+      draftBeforeHistory = "";
+      cmdHistory.push(value);
+      if (cmdHistory.length > 20) cmdHistory.shift();
+      applyFace("listening", value); // optimistic immediate feedback; Python's own
+                                      // listening -> thinking -> ... follows right after
       sendCommand(value);
+      // return focus to the command box once the action has had time to run --
+      // unless it moved focus to a real page field (e.g. "type X in the name field"),
+      // which we must never steal focus from.
+      setTimeout(() => {
+        const activeInPage = document.activeElement;
+        const isEmpty = !activeInPage || activeInPage === document.body || activeInPage === document.documentElement;
+        const isOurHost = activeInPage === host;
+        if (isEmpty || isOurHost) cmdInput.focus();
+      }, 1000);
+    }
+
+    function historyUp() {
+      if (cmdHistory.length === 0) return;
+      if (historyPos === -1) {
+        draftBeforeHistory = cmdInput.value;
+        historyPos = cmdHistory.length - 1;
+      } else if (historyPos > 0) {
+        historyPos--;
+      }
+      cmdInput.value = cmdHistory[historyPos];
+    }
+
+    function historyDown() {
+      if (historyPos === -1) return;
+      if (historyPos < cmdHistory.length - 1) {
+        historyPos++;
+        cmdInput.value = cmdHistory[historyPos];
+      } else {
+        historyPos = -1;
+        cmdInput.value = draftBeforeHistory;
+      }
+    }
+
+    function onCmdKeydown(e) {
+      // isolate the input from the page: site keyboard shortcuts (YouTube "k"/"f",
+      // GitHub "s", Gmail's single-letter shortcuts, ...) must never fire while typing
+      // here. Capture phase + stopImmediatePropagation on the target itself is the
+      // earliest possible point to cut the event off before it can bubble out through
+      // the shadow boundary (keydown/keyup/keypress are composed and DO cross it).
+      e.stopPropagation();
+      e.stopImmediatePropagation();
+      if (e.key === "Enter") {
+        if (e.shiftKey) return; // no special action
+        e.preventDefault();
+        submitCommand();
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        historyUp();
+      } else if (e.key === "ArrowDown") {
+        e.preventDefault();
+        historyDown();
+      } else if (e.key === "Escape") {
+        cmdInput.value = "";
+        historyPos = -1;
+        cmdInput.blur();
+      }
+    }
+    cmdInput.addEventListener("keydown", onCmdKeydown, { capture: true });
+    ["keyup", "keypress"].forEach((type) => {
+      cmdInput.addEventListener(type, (e) => {
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+      }, { capture: true });
     });
 
     // the page's own high-contrast mode (our accessibility command) applies
