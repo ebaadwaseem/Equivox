@@ -1,204 +1,313 @@
-"""executor/undo.py: "go back"/"undo" consults the action log instead of always
-calling page.go_back() on whatever tab happens to be active."""
+"""executor/undo.py: checkpoint-based "go back"/"undo".
+
+Pure-function tests use plain sentinel objects standing in for Page identity (the
+logic only needs `is`-identity, never calls Playwright methods on them). The
+end-to-end tests at the bottom drive a real browser through the 5 scenarios called
+out explicitly: JS redirect trap, meta-refresh trap, target=_blank popup,
+site-opened popup, and a double "go back".
+"""
 import asyncio
 from pathlib import Path
 
+import pytest
 from playwright.async_api import async_playwright
 
-from executor.undo import ActionLogEntry, undo_last
+from executor.undo import (
+    Checkpoint,
+    describe_candidate,
+    describe_checkpoint,
+    execute_undo,
+    find_candidates,
+    find_target,
+    normalize_url,
+    push_checkpoint,
+)
 
-FORM_URL = "data:text/html,<a id='l' href='%23two'>go</a><div id='two'>two</div>"
-POPUP_FIXTURE = (Path(__file__).parent / "fixtures" / "pages" / "popup.html").resolve().as_uri()
+PAGES = Path(__file__).parent / "fixtures" / "pages"
 
+
+def _uri(name: str) -> str:
+    return (PAGES / name).resolve().as_uri()
+
+
+class _FakePage:
+    """Stands in for Page identity in pure-logic tests; carries a .url for matching."""
+    def __init__(self, url: str):
+        self.url = url
+
+
+def _cp(page, url=None, title="") -> Checkpoint:
+    return Checkpoint(page=page, url=url or page.url, title=title)
+
+
+# ---- normalize_url ---------------------------------------------------------
+
+def test_normalize_url_strips_fragment():
+    assert normalize_url("https://example.com/page#section") == "https://example.com/page"
+
+
+def test_normalize_url_strips_utm_params():
+    assert normalize_url("https://example.com/?utm_source=x&id=5") == "https://example.com/?id=5"
+
+
+def test_normalize_url_keeps_non_tracking_params():
+    assert normalize_url("https://example.com/?q=hello") == "https://example.com/?q=hello"
+
+
+def test_normalize_url_equal_after_stripping():
+    a = normalize_url("https://example.com/p?utm_campaign=x#top")
+    b = normalize_url("https://example.com/p")
+    assert a == b
+
+
+# ---- find_target / find_candidates -----------------------------------------
+
+def test_find_target_most_recent_differing_same_tab():
+    page = _FakePage("https://x.com/c")
+    checkpoints = [_cp(page, "https://x.com/a"), _cp(page, "https://x.com/b")]
+    idx = find_target(checkpoints, page)
+    assert idx == 1  # most recent (b), not a
+
+
+def test_find_target_skips_identical_checkpoints():
+    page = _FakePage("https://x.com/c")
+    checkpoints = [_cp(page, "https://x.com/a"), _cp(page, "https://x.com/c")]  # same as current
+    idx = find_target(checkpoints, page)
+    assert idx == 0  # skips the identical one, finds 'a'
+
+
+def test_find_target_none_when_nothing_differs():
+    page = _FakePage("https://x.com/a")
+    checkpoints = [_cp(page, "https://x.com/a")]
+    assert find_target(checkpoints, page) is None
+
+
+def test_find_target_cross_tab():
+    tab_a = _FakePage("https://x.com/a")
+    tab_b = _FakePage("https://x.com/b")
+    checkpoints = [_cp(tab_a, "https://x.com/a")]
+    idx = find_target(checkpoints, tab_b)
+    assert idx == 0
+
+
+def test_find_target_same_tab_only_ignores_other_tabs():
+    tab_a = _FakePage("https://x.com/a")
+    tab_b = _FakePage("https://x.com/b")
+    checkpoints = [_cp(tab_a, "https://x.com/a"), _cp(tab_b, "https://x.com/prev-b")]
+    idx = find_target(checkpoints, tab_b, same_tab_only=True)
+    assert idx == 1  # the tab_a entry is ignored
+
+
+def test_find_candidates_single_when_same_tab_only_option():
+    page = _FakePage("https://x.com/c")
+    checkpoints = [_cp(page, "https://x.com/a")]
+    assert find_candidates(checkpoints, page) == [0]
+
+
+def test_find_candidates_two_when_cross_tab_and_same_tab_both_plausible():
+    tab_a = _FakePage("https://x.com/a")
+    tab_b = _FakePage("https://x.com/b")
+    checkpoints = [_cp(tab_a, "https://x.com/prev-a"), _cp(tab_b, "https://x.com/b")]
+    # most recent checkpoint is for tab_b itself (index 1) but matches current URL,
+    # so it's skipped by find_target; the cross-tab one (tab_a, index 0) is primary
+    cands = find_candidates(checkpoints, tab_b)
+    assert 0 in cands
+
+
+def test_describe_checkpoint_prefers_title():
+    page = _FakePage("https://example.com/")
+    cp = _cp(page, title="My Page")
+    assert describe_checkpoint(cp) == "My Page"
+
+
+def test_describe_checkpoint_falls_back_to_hostname():
+    page = _FakePage("https://example.com/path")
+    cp = _cp(page, title="")
+    assert describe_checkpoint(cp) == "example.com"
+
+
+def test_describe_candidate_same_tab_phrasing():
+    page = _FakePage("https://x.com/a")
+    checkpoints = [_cp(page, "https://x.com/prev", title="Prev")]
+    desc = describe_candidate(checkpoints, 0, page)
+    assert "previous page" in desc
+    assert "Prev" in desc
+
+
+def test_describe_candidate_cross_tab_phrasing():
+    tab_a = _FakePage("https://x.com/a")
+    tab_b = _FakePage("https://x.com/b")
+    checkpoints = [_cp(tab_a, title="Tab A")]
+    desc = describe_candidate(checkpoints, 0, tab_b)
+    assert "close this tab" in desc
+    assert "Tab A" in desc
+
+
+# ---- end-to-end: the 5 explicit scenarios ----------------------------------
 
 def _run(coro):
     return asyncio.run(coro)
 
 
-def test_undo_with_empty_log_falls_back_to_go_back():
+def test_js_redirect_trap_go_back_lands_on_a_not_b():
     async def scenario():
         async with async_playwright() as p:
             browser = await p.chromium.launch()
             ctx = await browser.new_context()
             page = await ctx.new_page()
-            await page.goto("data:text/html,<p>a</p>")
-            await page.goto("data:text/html,<p>b</p>")
-            new_page, desc = await undo_last(ctx, [], page)
+            await page.goto(_uri("redirect_a.html"))
+
+            checkpoints: list[Checkpoint] = []
+            await push_checkpoint(checkpoints, page)  # user is about to click
+            await page.click("#link-to-b")
+            await page.wait_for_load_state("load")
+            await asyncio.sleep(0.5)  # let the JS redirect to C fire
+            assert "redirect_c" in page.url  # landed on C, past the B redirect trap
+
+            idx = find_target(checkpoints, page)
+            assert idx is not None
+            new_page, desc = await execute_undo(ctx, checkpoints, idx, page)
+            landed_on_a = "redirect_a" in new_page.url
             await browser.close()
-            return new_page is page, desc
+            return landed_on_a, desc
 
-    same_page, desc = _run(scenario())
-    assert same_page
-    assert desc == "Going back"
+    landed_on_a, desc = _run(scenario())
+    assert landed_on_a
+    assert "Going back" in desc
 
 
-def test_undo_new_tab_closes_it_and_returns_to_opener():
+def test_meta_refresh_trap_go_back_lands_on_a_not_b():
+    async def scenario():
+        async with async_playwright() as p:
+            browser = await p.chromium.launch()
+            ctx = await browser.new_context()
+            page = await ctx.new_page()
+            await page.goto(_uri("redirect_a.html"))
+
+            checkpoints: list[Checkpoint] = []
+            await push_checkpoint(checkpoints, page)
+            await page.click("#link-to-meta-b")
+            await page.wait_for_load_state("load")
+            await asyncio.sleep(0.5)
+            assert "redirect_c" in page.url
+
+            idx = find_target(checkpoints, page)
+            new_page, desc = await execute_undo(ctx, checkpoints, idx, page)
+            landed_on_a = "redirect_a" in new_page.url
+            await browser.close()
+            return landed_on_a
+
+    assert _run(scenario())
+
+
+def test_target_blank_link_go_back_closes_new_tab_returns_to_opener():
     async def scenario():
         async with async_playwright() as p:
             browser = await p.chromium.launch()
             ctx = await browser.new_context()
             opener = await ctx.new_page()
-            await opener.goto("data:text/html,<p>opener</p>")
-            new_tab = await ctx.new_page()
-            await new_tab.goto("data:text/html,<p>new tab</p>")
-            log = [ActionLogEntry(kind="new_tab", page=new_tab, previous_page=opener, label="the previous tab")]
+            await opener.goto(_uri("popup.html"))
 
-            active, desc = await undo_last(ctx, log, new_tab)
+            checkpoints: list[Checkpoint] = []
+            active_box = [opener]
+
+            async def on_new_page(new_page):
+                o = await new_page.opener()
+                if o is None:
+                    return
+                await new_page.wait_for_load_state("domcontentloaded")
+                active_box[0] = new_page
+
+            ctx.on("page", lambda p: asyncio.ensure_future(on_new_page(p)))
+
+            await push_checkpoint(checkpoints, opener)  # user about to click
+            await opener.click("#blank-link")
+            await asyncio.sleep(0.3)
+            assert len(ctx.pages) == 2
+            popup = active_box[0]
+            assert popup is not opener
+
+            idx = find_target(checkpoints, popup)
+            new_page, desc = await execute_undo(ctx, checkpoints, idx, popup)
+            is_opener = new_page is opener
             tabs_remaining = len(ctx.pages)
             await browser.close()
-            return active is opener, tabs_remaining, desc, log
-
-    is_opener, remaining, desc, log = _run(scenario())
-    assert is_opener
-    assert remaining == 1  # the new tab got closed
-    assert "Closing that tab" in desc
-    assert log == []  # entry was popped
-
-
-def test_undo_popup_same_as_new_tab():
-    async def scenario():
-        async with async_playwright() as p:
-            browser = await p.chromium.launch()
-            ctx = await browser.new_context()
-            opener = await ctx.new_page()
-            popup = await ctx.new_page()
-            log = [ActionLogEntry(kind="popup", page=popup, previous_page=opener, label="DuckDuckGo")]
-            active, desc = await undo_last(ctx, log, popup)
-            remaining = len(ctx.pages)
-            await browser.close()
-            return active is opener, remaining, desc
+            return is_opener, tabs_remaining, desc
 
     is_opener, remaining, desc = _run(scenario())
     assert is_opener
     assert remaining == 1
-    assert "DuckDuckGo" in desc
-
-
-def test_undo_switch_tab_switches_back_without_closing():
-    async def scenario():
-        async with async_playwright() as p:
-            browser = await p.chromium.launch()
-            ctx = await browser.new_context()
-            page_a = await ctx.new_page()
-            page_b = await ctx.new_page()
-            log = [ActionLogEntry(kind="switch_tab", page=page_b, previous_page=page_a, label="tab A")]
-            active, desc = await undo_last(ctx, log, page_b)
-            remaining = len(ctx.pages)
-            await browser.close()
-            return active is page_a, remaining, desc
-
-    is_a, remaining, desc = _run(scenario())
-    assert is_a
-    assert remaining == 2  # nothing closed
-    assert "Switching back" in desc
-
-
-def test_undo_close_tab_reopens_at_url_before():
-    async def scenario():
-        async with async_playwright() as p:
-            browser = await p.chromium.launch()
-            ctx = await browser.new_context()
-            page = await ctx.new_page()
-            url = "data:text/html,<p>revived</p>"
-            log = [ActionLogEntry(kind="close_tab", url_before=url, label="the old tab")]
-            active, desc = await undo_last(ctx, log, page)
-            content = await active.content()
-            await browser.close()
-            return "revived" in content, desc
-
-    found, desc = _run(scenario())
-    assert found
-    assert "Reopening" in desc
-
-
-def test_undo_click_goes_back_on_that_tab():
-    async def scenario():
-        async with async_playwright() as p:
-            browser = await p.chromium.launch()
-            ctx = await browser.new_context()
-            page = await ctx.new_page()
-            await page.goto("data:text/html,<p>first</p>")
-            await page.goto("data:text/html,<p>second</p>")
-            log = [ActionLogEntry(kind="click", page=page, label="first")]
-            active, desc = await undo_last(ctx, log, page)
-            content = await active.content()
-            await browser.close()
-            return "first" in content, desc
-
-    found, desc = _run(scenario())
-    assert found
     assert "Going back" in desc
 
 
-# ---- end-to-end: link opening a new tab vs. a normal same-tab link --------
-# Mirrors main.py's actual wiring: ctx.on("page") detects popups via Page.opener(),
-# pushes an ActionLogEntry, and "go back" reverses whichever kind of action was last.
-
-async def _detect_popup_and_log(ctx, action_log, active_page_box):
-    async def on_new_page(new_page):
-        opener = await new_page.opener()
-        if opener is None:
-            return
-        previous = active_page_box[0]
-        await new_page.wait_for_load_state("domcontentloaded")
-        active_page_box[0] = new_page
-        action_log.append(ActionLogEntry(kind="popup", page=new_page, previous_page=previous, label=previous.url))
-
-    ctx.on("page", lambda p: asyncio.ensure_future(on_new_page(p)))
-
-
-def test_link_opening_new_tab_then_go_back_returns_to_original_tab():
+def test_site_opened_popup_on_load_go_back_closes_it():
     async def scenario():
         async with async_playwright() as p:
             browser = await p.chromium.launch()
             ctx = await browser.new_context()
-            page = await ctx.new_page()
-            await page.goto(POPUP_FIXTURE)
-            action_log: list[ActionLogEntry] = []
-            active_page_box = [page]
-            await _detect_popup_and_log(ctx, action_log, active_page_box)
+            opener = await ctx.new_page()
 
-            await page.click("#blank-link")
-            await asyncio.sleep(0.3)  # let the "page" event handler run
+            checkpoints: list[Checkpoint] = []
+            active_box = [opener]
+
+            async def on_new_page(new_page):
+                o = await new_page.opener()
+                if o is None:
+                    return
+                new_page.site_opened = True  # no recent user command drove this
+                await new_page.wait_for_load_state("domcontentloaded")
+                active_box[0] = new_page
+
+            ctx.on("page", lambda p: asyncio.ensure_future(on_new_page(p)))
+
+            await push_checkpoint(checkpoints, opener)  # user navigates to the auto-popup page
+            await opener.goto(_uri("popup_on_load.html"))
+            await asyncio.sleep(0.5)  # let the page's own window.open() fire
             assert len(ctx.pages) == 2
-            assert active_page_box[0] is not page  # popup became active
+            popup = active_box[0]
+            assert popup is not opener
+            assert getattr(popup, "site_opened", False) is True
 
-            new_active, desc = await undo_last(ctx, action_log, active_page_box[0])
+            idx = find_target(checkpoints, popup)
+            new_page, desc = await execute_undo(ctx, checkpoints, idx, popup)
+            is_opener = new_page is opener
             tabs_remaining = len(ctx.pages)
-            is_original = new_active is page
             await browser.close()
-            return is_original, tabs_remaining, desc
+            return is_opener, tabs_remaining
 
-    is_original, tabs_remaining, desc = _run(scenario())
-    assert is_original
-    assert tabs_remaining == 1
-    assert "Closing that tab" in desc
+    is_opener, remaining = _run(scenario())
+    assert is_opener
+    assert remaining == 1
 
 
-def test_normal_link_then_go_back_goes_back_in_same_tab():
+def test_go_back_twice_walks_two_checkpoints():
     async def scenario():
         async with async_playwright() as p:
             browser = await p.chromium.launch()
             ctx = await browser.new_context()
             page = await ctx.new_page()
-            await page.goto(POPUP_FIXTURE)
-            action_log: list[ActionLogEntry] = []
-            active_page_box = [page]
-            await _detect_popup_and_log(ctx, action_log, active_page_box)
 
-            url_before = page.url
-            await page.click("#normal-link")
-            await page.wait_for_load_state("load")
-            assert len(ctx.pages) == 1  # no new tab opened
-            action_log.append(ActionLogEntry(kind="click", page=page, url_before=url_before, label="Normal link"))
+            checkpoints: list[Checkpoint] = []
 
-            new_active, desc = await undo_last(ctx, action_log, page)
-            back_url = new_active.url
-            tabs_remaining = len(ctx.pages)
+            await page.goto(_uri("redirect_a.html"))
+            await push_checkpoint(checkpoints, page)  # checkpoint 1: on A
+            await page.goto(_uri("redirect_c.html"))  # pretend-command: navigate to C
+            await push_checkpoint(checkpoints, page)  # checkpoint 2: on C
+            await page.goto(_uri("second.html"))  # pretend-command: navigate to "second"
+
+            # first "go back": from second.html -> should land on C (checkpoint 2)
+            idx1 = find_target(checkpoints, page)
+            page, desc1 = await execute_undo(ctx, checkpoints, idx1, page)
+            first_url = page.url
+
+            # second "go back again": from C -> should land on A (checkpoint 1)
+            idx2 = find_target(checkpoints, page)
+            page, desc2 = await execute_undo(ctx, checkpoints, idx2, page)
+            second_url = page.url
+
             await browser.close()
-            return back_url, tabs_remaining, desc, url_before
+            return first_url, second_url
 
-    back_url, tabs_remaining, desc, url_before = _run(scenario())
-    assert back_url == url_before  # went back within the SAME tab
-    assert tabs_remaining == 1  # nothing closed
-    assert "Going back" in desc
+    first_url, second_url = _run(scenario())
+    assert "redirect_c" in first_url
+    assert "redirect_a" in second_url

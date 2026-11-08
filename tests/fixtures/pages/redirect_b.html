@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Page B (redirecting)</title></head>
+<body>
+<h1>Page B</h1>
+<p>Redirecting…</p>
+<script>
+  // plain assignment (not location.replace) so this adds its own history entry --
+  // a naive single page.go_back() from C would land here, not on A. A short delay
+  // (vs. an instant synchronous redirect) is needed for Chromium to actually commit
+  // this page as its own history entry instead of coalescing it with the redirect.
+  // Skip the redirect on back/forward navigation (a real technique sites use) so
+  // landing back on B via history doesn't just bounce forward to C again.
+  const navEntry = performance.getEntriesByType("navigation")[0];
+  const isBackForward = navEntry && navEntry.type === "back_forward";
+  if (!isBackForward) {
+    setTimeout(() => { location.href = "redirect_c.html"; }, 80);
+  }
+</script>
+</body>
+</html>

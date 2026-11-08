@@ -30,9 +30,11 @@ logger = logging.getLogger("main")
 
 AFFIRM = {"yes", "yeah", "yep", "yup", "confirm", "do it", "sure", "go ahead", "ok", "okay"}
 DENY = {"no", "nope", "nah", "cancel", "never mind", "nevermind", "stop", "don't"}
-UNDO_PHRASES = {"go back", "back", "undo", "undo that"}
+UNDO_PHRASES = {"go back", "back", "undo", "undo that", "go back again"}
+PREV_TAB_PHRASES = {"previous tab", "last tab"}
+PREV_PAGE_PHRASES = {"previous page"}
+SITE_OPENED_WINDOW_S = 2.0  # no user command running in this window -> an unprompted popup
 TAB_INTENTS = {"new_tab", "close_tab", "switch_tab"}
-NAV_INTENTS = {"click", "navigate", "search"}
 ERROR_REVERT_S = 4.0
 
 
@@ -59,13 +61,15 @@ async def main() -> None:
 
         active_page = None  # tab commands can change which Page subsequent commands act on
         recent_actions: list[str] = []
-        action_log: list[undo.ActionLogEntry] = []  # for smart "go back"/"undo"
-        pending: dict | None = None  # {"kind": "confirm"|"disambiguate", "decision": Decision, ...}
+        checkpoints: list[undo.Checkpoint] = []  # for smart "go back"/"undo"
+        last_command_ts = 0.0  # when the most recent user command STARTED executing
+        pending: dict | None = None  # {"kind": "confirm"|"disambiguate"|"undo_disambiguate", ...}
 
         async def on_new_page(new_page) -> None:
             """Detects popups/new tabs the PAGE itself opened (target=_blank, window.open)
             -- our own act.new_tab() calls also fire this event but have no opener, so
-            they're skipped here; run_action() logs those itself."""
+            they're skipped here. Never creates a checkpoint: popups are site-initiated
+            by definition, which is exactly what checkpoints must NOT capture."""
             nonlocal active_page
             try:
                 opener = await new_page.opener()
@@ -73,37 +77,36 @@ async def main() -> None:
                 opener = None
             if opener is None:
                 return
-            previous = active_page
+            new_page.site_opened = (time.time() - last_command_ts) > SITE_OPENED_WINDOW_S
             try:
                 await new_page.wait_for_load_state("domcontentloaded", timeout=5000)
             except Exception:
                 pass
             active_page = new_page
-            action_log.append(undo.ActionLogEntry(kind="popup", page=new_page, previous_page=previous, label=previous.url))
-            print("  ↗ popup opened:", new_page.url)
+            print("  ↗ popup opened:", new_page.url, "(unprompted)" if new_page.site_opened else "")
             await vox.show_on(active_page)
 
         ctx.on("page", lambda p: asyncio.ensure_future(on_new_page(p)))
 
+        async def mark_user_command() -> None:
+            nonlocal last_command_ts
+            last_command_ts = time.time()
+            await undo.push_checkpoint(checkpoints, active_page)
+
         async def run_action(d: Decision, target_name: str = "") -> None:
             nonlocal active_page
+            await mark_user_command()
+
             if d.intent in TAB_INTENTS:
-                previous_page = active_page
                 try:
                     if d.intent == "new_tab":
                         active_page = await act.new_tab(ctx, d.text)
-                        action_log.append(undo.ActionLogEntry(
-                            kind="new_tab", page=active_page, previous_page=previous_page, label=previous_page.url))
                         print("  ✓ opened new tab", active_page.url)
                     elif d.intent == "close_tab":
-                        closing_url = active_page.url
                         active_page = await act.close_tab(ctx, active_page)
-                        action_log.append(undo.ActionLogEntry(kind="close_tab", url_before=closing_url, label=closing_url))
                         print("  ✓ closed tab, now on", active_page.url)
                     elif d.intent == "switch_tab":
                         active_page = await act.switch_tab(ctx, active_page, d.text or "next")
-                        action_log.append(undo.ActionLogEntry(
-                            kind="switch_tab", page=active_page, previous_page=previous_page, label=previous_page.url))
                         print("  ✓ switched tab ->", active_page.url)
                     recent_actions.append(f"did {d.intent} {d.text or ''}".strip())
                     del recent_actions[:-5]
@@ -116,16 +119,11 @@ async def main() -> None:
                 return
             if d.target_id:
                 await highlight(active_page, d.target_id)
-            url_before = active_page.url
             try:
                 result = await execute(active_page, d)
                 print("  ✓", result)
                 recent_actions.append(result)
                 del recent_actions[:-5]
-                if d.intent in NAV_INTENTS and active_page.url != url_before:
-                    action_log.append(undo.ActionLogEntry(
-                        kind="click" if d.intent == "click" else "navigate",
-                        page=active_page, url_before=url_before, label=target_name or url_before))
                 if result.startswith("no match"):
                     await vox.set_then_idle_after(
                         active_page, "error", vox.describe_not_found(d.text or target_name), delay=ERROR_REVERT_S)
@@ -138,6 +136,53 @@ async def main() -> None:
                 print("  ✗ action failed")
                 await vox.set_then_idle_after(
                     active_page, "error", vox.describe_failure(d.intent.replace("_", " ")), delay=ERROR_REVERT_S)
+
+        async def go_back_to(index: int) -> None:
+            nonlocal active_page
+            new_page, desc = await undo.execute_undo(ctx, checkpoints, index, active_page)
+            active_page = new_page
+            print("  ✓", desc)
+            await vox.set_then_idle_after(active_page, "acting", desc)
+
+        async def resolve_and_execute_undo(same_tab_only: bool = False) -> None:
+            nonlocal pending
+            if same_tab_only:
+                idx = undo.find_target(checkpoints, active_page, same_tab_only=True)
+                if idx is None:
+                    await vox.set_then_idle_after(
+                        active_page, "error", "There's no previous page on this tab to go back to.", delay=ERROR_REVERT_S)
+                    return
+                await go_back_to(idx)
+                return
+
+            candidates = undo.find_candidates(checkpoints, active_page)
+            if not candidates:
+                try:
+                    await active_page.go_back()
+                except Exception:
+                    pass
+                print("  ✓ Going back")
+                await vox.set_then_idle_after(active_page, "acting", "Going back")
+                return
+            if len(candidates) == 1:
+                await go_back_to(candidates[0])
+                return
+
+            model = os.getenv("VB_MODEL", "")
+            idx, confidence = await undo.resolve_ambiguity(model, checkpoints, candidates, active_page)
+            if idx is not None and confidence >= undo.AMBIGUITY_CONFIDENCE_THRESHOLD:
+                await go_back_to(idx)
+                return
+
+            print("  ❓ Which one did you mean?")
+            for i, cand_idx in enumerate(candidates, 1):
+                print(f"     {i}) {undo.describe_candidate(checkpoints, cand_idx, active_page)}")
+            options = "   ".join(
+                f"{i} · {undo.describe_candidate(checkpoints, cand_idx, active_page)}"
+                for i, cand_idx in enumerate(candidates, 1)
+            )
+            await vox.set(active_page, "unsure", f"Did you mean: {options}")
+            pending = {"kind": "undo_disambiguate", "candidates": candidates}
 
         async def on_vox_command(text: str) -> None:
             sched.submit(Transcript(text=text, is_final=True))
@@ -160,11 +205,20 @@ async def main() -> None:
                 print("  ✓ showed Vox")
                 pending = None
                 return
+            # explicit phrases skip inference entirely
+            if text_norm in PREV_TAB_PHRASES:
+                await mark_user_command()
+                active_page = await act.switch_tab(ctx, active_page, "previous")
+                await vox.show_on(active_page)
+                await vox.set_then_idle_after(active_page, "acting", "Switching to the previous tab")
+                pending = None
+                return
+            if text_norm in PREV_PAGE_PHRASES:
+                await resolve_and_execute_undo(same_tab_only=True)
+                pending = None
+                return
             if text_norm in UNDO_PHRASES:
-                new_page, desc = await undo.undo_last(ctx, action_log, active_page)
-                active_page = new_page
-                print("  ✓", desc)
-                await vox.set_then_idle_after(active_page, "acting", desc)
+                await resolve_and_execute_undo()
                 pending = None
                 return
 
@@ -190,6 +244,16 @@ async def main() -> None:
                         d.ambiguous = False
                         pending = None
                         await run_action(d, candidates[idx].name)
+                        return
+                pending = None  # fall through and treat this as a new command
+
+            if pending and pending["kind"] == "undo_disambiguate":
+                if text_norm.isdigit():
+                    idx = int(text_norm) - 1
+                    candidates = pending["candidates"]
+                    if 0 <= idx < len(candidates):
+                        pending = None
+                        await go_back_to(candidates[idx])
                         return
                 pending = None  # fall through and treat this as a new command
 
