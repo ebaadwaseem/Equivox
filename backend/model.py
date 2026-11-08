@@ -83,19 +83,26 @@ async def decide(
         elements_text, transcript, recent_actions, page=page,
         context=context, pending_confirmation=pending_confirmation,
     )
-    criteria = build_choice_criteria(elements)
+    state_bytes = len(state.encode())
+    if page and page.get("screenshot_b64"):
+        # OpenRouter's multimodal decision state; opt-in for a vision-capable model.
+        state = [{"type": "text", "text": state},
+                 {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + page["screenshot_b64"]}}]
+    # Descriptions already live in ELEMENTS, including options/focus/geometry.
+    criteria = {e.id: None for e in elements} | {"none": "No observed element is referred to"}
     questions: dict = {
         "act_now": {
             "type": "choice",
             "instructions": (
-                "Can the words in the transcript be executed now, or should the browser wait? "
-                "Judge the command said so far; use page and context to resolve back/other references."
+                "Is the CURRENT transcript clause executable already? It need not be the end of the speaker's turn. "
+                "'open a new tab' and 'scroll down' are complete; 'search for' is missing its query. "
+                "Do not replay CONTEXT. Use it only to resolve references."
             ),
             "criteria": ACT_NOW_CRITERIA,
         },
         "intent": {
             "type": "choice",
-            "instructions": "What kind of browser action is the speaker asking for?",
+            "instructions": "Classify the single action explicitly requested in the CURRENT TRANSCRIPT, even if the speaker requested the same action earlier. CONTEXT supplies references, not commands. Search queries are search, never navigate or new_tab URLs.",
             "criteria": INTENT_CRITERIA,
         },
         "target": {
@@ -151,7 +158,7 @@ async def decide(
 
     logger.debug(
         "jev request: model=%s state_bytes=%d questions=%s",
-        model, len(state.encode()), list(questions.keys()),
+        model, state_bytes, list(questions.keys()),
     )
     answers = await jev.ask(model, state, questions)
     logger.info("jev call: %.0f ms, answers=%s", (time.perf_counter() - t0) * 1000, "ok" if answers else "FAILED")
@@ -167,7 +174,8 @@ async def decide(
             is_command_p = 1.0 - float(act_probs.get("not_a_command", 0.0))
         else:
             is_command_p = 0.0 if act_key == "not_a_command" else max(0.5, act_conf)
-        complete_p = act_conf if act_key in ("clause_complete", "utterance_complete") else 0.0
+        complete_p = (float(act_probs.get("clause_complete", 0)) + float(act_probs.get("utterance_complete", 0))) if act_probs else (
+            act_conf if act_key in ("clause_complete", "utterance_complete") else 0.0)
     else:
         is_command_p = jev.noul(answers, "is_command")
         complete_p = jev.noul(answers, "complete", default=1.0)
@@ -216,10 +224,14 @@ async def decide(
             tab_text = tab_choice if tab_choice not in (None, "none") else "next"
 
     target_name = next((e.name for e in elements if e.id == target_id), "")
-    if intent == "type" and not target_id:
-        target_id = next((e.id for e in elements if e.role == "textbox"), None)
-    if intent == "select" and not target_id:
-        target_id = next((e.id for e in elements if e.role == "select"), None)
+    if intent in {"type", "select"} and not target_id:
+        fields = [e for e in elements if e.role == ("textbox" if intent == "type" else "select")]
+        focused = next((e for e in fields if e.active), None)
+        if focused or len(fields) == 1:
+            target_id = (focused or fields[0]).id
+            target_conf = target_top_prob = 1.0
+    if target_id and target_id not in {e.id for e in elements}:
+        target_id = None
 
     text_pick, _, _ = jev.choice(answers, "text_span")
     url_pick, _, _ = jev.choice(answers, "url_span")
@@ -280,10 +292,11 @@ def _extract_text_for_intent(
     text_pick=_MISSING,
     url_pick=_MISSING,
 ) -> Optional[str]:
-    if text_pick is not _MISSING:
-        return None if text_pick in (None, "none") else text_pick
-    if url_pick is not _MISSING:
-        return None if url_pick in (None, "none") else url_pick
+    # Questions are independent/speculative; route only the relevant candidate.
+    if intent in {"type", "search", "find"} and text_pick is not _MISSING:
+        return text_pick if text_pick in spans.extract_text_candidates(transcript) else None
+    if intent in {"navigate", "new_tab"} and url_pick is not _MISSING:
+        return url_pick if url_pick in spans.extract_url_candidates(transcript) else None
 
     if intent == "type":
         return spans.extract_type_text(transcript) or _first(spans.extract_text_candidates(transcript))

@@ -82,3 +82,12 @@ def test_scroll_score_maps_to_a_fraction(monkeypatch):
     d, _ = _run("scroll down", answers, monkeypatch)
     assert d.intent == "scroll"
     assert d.scroll_amount == 1.0
+
+
+def test_opt_in_vision_uses_multimodal_state_without_changing_typed_choices(monkeypatch):
+    _, calls = _run("scroll down", _answers(None, "scroll"), monkeypatch,
+                    page={"url": "about:blank", "screenshot_b64": "AA=="})
+    state = calls[0]["state"]
+    assert state[0]["type"] == "text"
+    assert "TRANSCRIPT: scroll down" in state[0]["text"]
+    assert state[1]["image_url"]["url"] == "data:image/jpeg;base64,AA=="

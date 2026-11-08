@@ -210,6 +210,7 @@ def test_target_blank_link_go_back_closes_new_tab_returns_to_opener():
 
             checkpoints: list[Checkpoint] = []
             active_box = [opener]
+            popup_ready = asyncio.Event()
 
             async def on_new_page(new_page):
                 o = await new_page.opener()
@@ -217,12 +218,13 @@ def test_target_blank_link_go_back_closes_new_tab_returns_to_opener():
                     return
                 await new_page.wait_for_load_state("domcontentloaded")
                 active_box[0] = new_page
+                popup_ready.set()
 
             ctx.on("page", lambda p: asyncio.ensure_future(on_new_page(p)))
 
             await push_checkpoint(checkpoints, opener)  # user about to click
             await opener.click("#blank-link")
-            await asyncio.sleep(0.3)
+            await asyncio.wait_for(popup_ready.wait(), timeout=3)
             assert len(ctx.pages) == 2
             popup = active_box[0]
             assert popup is not opener

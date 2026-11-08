@@ -16,6 +16,7 @@ TARGET_TOP_PROB_THRESHOLD = 0.35
 DESTRUCTIVE_THRESHOLD = 0.50
 SILENCE_COMPLETE_MS = 900
 PAYLOAD_SILENCE_MS = 600
+EXECUTABLE_PROBABILITY_THRESHOLD = 0.75
 AMBIGUOUS_GAP = 0.2
 
 PAYLOAD_INTENTS = {"type", "search", "navigate", "select", "find"}
@@ -60,10 +61,18 @@ def evaluate(d: Decision, is_final: bool, silent_ms: float = 0.0, stale: bool = 
     # A decision computed from text the recognizer has already superseded must not act:
     # the newest transcript has its own request in flight, and committing both would run
     # the same command twice (e.g. "scroll" then "scroll down").
-    if stale and not (is_final or silent_ms >= SILENCE_COMPLETE_MS):
+    if stale:
         return PolicyResult("WAIT", _retry(silent_ms, SILENCE_COMPLETE_MS))
 
     if d.intent == "none" or d.intent_confidence < INTENT_CONFIDENCE_THRESHOLD:
+        return PolicyResult("WAIT", _retry(silent_ms, SILENCE_COMPLETE_MS))
+
+    # Silence/finality says the recognizer stopped, not that missing arguments
+    # became available. Never turn 'open a new …' into an executable command.
+    if d.act_now == "incomplete":
+        return PolicyResult("WAIT")
+
+    if not is_final and silent_ms < SILENCE_COMPLETE_MS and d.complete_confidence < EXECUTABLE_PROBABILITY_THRESHOLD:
         return PolicyResult("WAIT", _retry(silent_ms, SILENCE_COMPLETE_MS))
 
     if d.destructive:
@@ -76,14 +85,11 @@ def evaluate(d: Decision, is_final: bool, silent_ms: float = 0.0, stale: bool = 
         return PolicyResult("DISAMBIGUATE")
 
     silent = silent_ms >= SILENCE_COMPLETE_MS or is_final
-    if d.act_now == "incomplete":
-        if not silent:
-            return PolicyResult("WAIT", _retry(silent_ms, SILENCE_COMPLETE_MS))
-    elif d.act_now not in ("clause_complete", "utterance_complete"):
+    if d.act_now not in ("clause_complete", "utterance_complete"):
         if not silent:
             return PolicyResult("WAIT", _retry(silent_ms, SILENCE_COMPLETE_MS))
 
-    if d.intent == "click" and not d.target_id:
+    if d.intent in {"click", "type", "select"} and not d.target_id:
         return PolicyResult("DISAMBIGUATE")
 
     if d.intent in PAYLOAD_INTENTS:

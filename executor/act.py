@@ -1,7 +1,7 @@
 """Executor (role 4, not staffed yet). Basic version so the loop works end to end.
 Code builds URLs; the model never writes them."""
 import re
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlsplit
 
 from playwright.async_api import BrowserContext, Page
 
@@ -10,28 +10,80 @@ from shared.protocol import Decision
 _HIGH_CONTRAST_STYLE_ID = "vb-high-contrast"
 
 
+def navigation_url(text: str) -> str:
+    """Validate before touching the browser; search queries never become bare URLs."""
+    text = text.strip()
+    if not text or any(c.isspace() for c in text):
+        raise ValueError("Expected a web address; use search for a query")
+    url = text if "://" in text else f"https://{text}"
+    parsed = urlsplit(url)
+    host = parsed.hostname or ""
+    if parsed.scheme not in {"http", "https"} or not host or parsed.username or parsed.password:
+        raise ValueError("Expected an HTTP or HTTPS address")
+    if host != "localhost" and "." not in host and ":" not in host:
+        raise ValueError("Expected a domain name")
+    # Accessing port validates malformed ports as well.
+    parsed.port
+    return url
+
+
+def target_locator(page, target_id: str):
+    """Frame-qualified IDs select the same observed frame; locators pierce open shadow roots."""
+    scope = page
+    if target_id.startswith("f") and ":" in target_id:
+        frame, target_id = target_id.split(":", 1)
+        scope = page.frames[int(frame[1:])]
+    if not re.fullmatch(r"e\d+", target_id):
+        raise ValueError("Invalid observed target ID")
+    return scope.locator(f'[data-vb-id="{target_id}"]').first
+
+
+async def select_value(page, locator, text: str) -> str:
+    tag = await locator.evaluate("el => el.tagName.toLowerCase()")
+    if tag == "select":
+        options = await locator.evaluate("el => Array.from(el.options).filter(o => !o.disabled && !o.parentElement.disabled).map(o => ({label:o.label, value:o.value, index:o.index}))")
+        key = text.strip().casefold()
+        matches = [o for o in options if key in {o["label"].strip().casefold(), o["value"].casefold()}]
+        if not matches:
+            matches = [o for o in options if key and key in o["label"].casefold()]
+        if len(matches) != 1:
+            return f'no match or ambiguous option "{text}"'
+        await locator.select_option(index=matches[0]["index"], timeout=3000)
+        return f'selected {matches[0]["label"]}'
+    # ARIA combobox/listbox controls usually render their options in a portal.
+    await locator.click(timeout=3000)
+    option = page.get_by_role("option", name=re.compile(rf"^\s*{re.escape(text)}\s*$", re.I))
+    if await option.count() != 1:
+        return f'no match or ambiguous option "{text}"'
+    await option.click(timeout=3000)
+    return f"selected {text}"
+
+
 async def execute(page: Page, d: Decision) -> str:
-    sel = f'[data-vb-id="{d.target_id}"]' if d.target_id else None
+    sel = target_locator(page, d.target_id) if d.target_id else None
     match d.intent:
         case "click" if sel:
-            await page.locator(sel).first.click(timeout=3000)
+            await sel.click(timeout=3000)
         case "type" if sel:
-            await page.locator(sel).first.fill(d.text or "", timeout=3000)
+            # Some widgets put the observed role on a wrapper around the input.
+            if not await sel.evaluate("el => el.matches('input,textarea') || el.isContentEditable"):
+                sel = sel.locator('input,textarea,[contenteditable="true"]').first
+            await sel.fill(d.text or "", timeout=3000)
         case "select" if sel:
-            await page.locator(sel).first.select_option(label=d.text or "", timeout=3000)
+            scope = page.frames[int(d.target_id.split(":", 1)[0][1:])] if d.target_id.startswith("f") else page
+            return await select_value(scope, sel, d.text or "")
         case "scroll":
             return await scroll(page, d.scroll_amount, d.scroll_to)
         case "back":
-            await page.go_back()
+            await page.go_back(wait_until="domcontentloaded")
         case "forward":
-            await page.go_forward()
+            await page.go_forward(wait_until="domcontentloaded")
         case "navigate" if d.text:
-            url = d.text if d.text.startswith("http") else f"https://{d.text}"
-            await page.goto(url)
+            await page.goto(navigation_url(d.text), wait_until="domcontentloaded")
         case "search" if d.text:
             # the plain duckduckgo.com/?q= form doesn't render results without JS; the
             # static /html/ endpoint does and is faster to load.
-            await page.goto(f"https://duckduckgo.com/html/?q={quote_plus(d.text)}")
+            await page.goto(f"https://duckduckgo.com/html/?q={quote_plus(d.text)}", wait_until="domcontentloaded")
         case "find" if d.text:
             return await find_text(page, d.text)
         case "accessibility" if d.text:
@@ -146,11 +198,9 @@ async def scroll(page: Page, fraction: float, scroll_to: str | None) -> str:
 
 async def highlight(page: Page, target_id: str) -> None:
     """Flash an outline on the target so the audience sees what's about to happen."""
-    await page.evaluate(
-        """id => { const el = document.querySelector(`[data-vb-id="${id}"]`);
-                  if (el) { el.style.outline = '3px solid #ff3b30';
-                            setTimeout(() => el.style.outline = '', 800); } }""",
-        target_id,
+    await target_locator(page, target_id).evaluate(
+        """el => { const old = el.style.outline; el.style.outline = '3px solid #ff3b30';
+                  setTimeout(() => el.style.outline = old, 800); }""", timeout=1000,
     )
 
 
@@ -213,12 +263,14 @@ async def apply_accessibility(page: Page, action: str) -> str:
 
 
 async def new_tab(ctx: BrowserContext, url: str | None = None) -> Page:
+    full_url = navigation_url(url) if url else None
     page = await ctx.new_page()
-    if url:
-        full_url = url if url.startswith("http") else f"https://{url}"
-        await page.goto(full_url)
-    else:
-        await page.goto("about:blank")
+    try:
+        if full_url:
+            await page.goto(full_url, wait_until="domcontentloaded")
+    except Exception:
+        await page.close()
+        raise
     return page
 
 

@@ -24,8 +24,8 @@ def test_only_committed_turns_are_stored_and_outcome_updates():
     assert ctx.last_turn().outcome == "Scrolling down"
 
 
-def test_oldest_turn_drops_beyond_six():
-    ctx = ConversationContext()
+def test_oldest_turn_drops_beyond_configured_window():
+    ctx = ConversationContext(max_turns=6)
     for i in range(7):
         ctx.commit(f"command {i}", _decision())
     assert len(ctx.turns) == 6

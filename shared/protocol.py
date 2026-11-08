@@ -43,6 +43,7 @@ class PageState:
     title: str
     elements: list[Element] = field(default_factory=list)
     screenshot_b64: Optional[str] = None   # optional low-res screenshot
+    summary: str = ""  # visible headings/status for semantic grounding
 
 
 # ---- Person 3 (backend/model) produces these ----

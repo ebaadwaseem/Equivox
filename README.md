@@ -47,3 +47,27 @@ backend/model.py      →  Decision
 executor/act.py       →  does it in the browser
 main.py               →  wires it all together
 ```
+
+## Incremental commands and history
+
+Speak or type a chain such as `open a new tab then search for physiotherapy clinics
+in edmonton okay now scroll down`. Each clause is decided against the page produced
+by the previous action. Complete commands can execute on partial speech; growing
+search/type payloads wait for a following command, recognition final, or quiet.
+Quote dictated text containing literal command connectors.
+
+Vox's **Recent speech & actions** shows up to 100 session actions across navigation.
+Highlighted rows are the twelve most recent actions included in Jev's context.
+History is kept in memory for the current process.
+
+`VB_VISION=1` optionally sends a JPEG page thumbnail (up to 768×512) with each
+request. Use a compatible vision decision model/endpoint; the default text/DOM path
+is faster. `VB_JEV_URL` overrides the OpenRouter System One endpoint when needed.
+The image transport uses OpenRouter state content parts, not TypeSafe's assets map.
+
+Install pytest with `python -m pip install pytest`, then run `python -m pytest -q`
+for offline regressions (tests ignore local API keys). Run
+`python -m scripts.benchmark_decisions --live` for a small synthetic API latency and
+policy probe using your configured key/model. It does not execute browser actions.
+See [refactor-plan.md](refactor-plan.md) for implementation findings, research,
+measured limits, and next steps.

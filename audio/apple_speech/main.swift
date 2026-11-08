@@ -114,6 +114,8 @@ final class Listener {
     var currentTask: SFSpeechRecognitionTask?
     var lastText = ""
     var lastUpdateTime = Date()
+    var lastVoiceActivity = Date.distantPast
+    var noiseFloor: Float = 0.001
     var hasFinalizedCurrent = false
     var paused = false
     var lastLevelEmit = Date.distantPast
@@ -159,6 +161,14 @@ final class Listener {
         let now = Date()
         guard now.timeIntervalSince(lastLevelEmit) >= Listener.levelEmitInterval else { return }
         lastLevelEmit = now
+        // A stalled partial is not silence. Keep the recognizer request alive
+        // while audio energy indicates speech, even if no new words arrive.
+        let speechThreshold = max(Float(0.006), noiseFloor * 3)
+        if rms > speechThreshold {
+            DispatchQueue.main.async { [weak self] in self?.lastVoiceActivity = now }
+        } else {
+            noiseFloor = noiseFloor * 0.95 + rms * 0.05
+        }
         // typical speech RMS on a laptop mic is well under 1.0 -- scale up so the
         // level is actually visible in the UI, then clamp.
         emitLevel(min(1.0, Double(rms) * 8))
@@ -238,7 +248,7 @@ final class Listener {
     private func startEndpointTimer() {
         let timer = Timer(timeInterval: Listener.endpointCheckInterval, repeats: true) { [weak self] _ in
             guard let self = self, !self.paused else { return }
-            let elapsedMs = Date().timeIntervalSince(self.lastUpdateTime) * 1000
+            let elapsedMs = Date().timeIntervalSince(max(self.lastUpdateTime, self.lastVoiceActivity)) * 1000
             if !self.lastText.isEmpty && elapsedMs >= Double(endpointMs) {
                 self.finalize(id: self.utteranceId, text: self.lastText, confidence: 0.9)
             }

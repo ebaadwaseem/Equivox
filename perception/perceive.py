@@ -3,6 +3,7 @@
 Turns the live page into a compact PageState, then a shortlist of elements the
 model can choose from, then compact text (or Jev "choice" criteria) to send it.
 """
+import asyncio
 import logging
 import re
 import time
@@ -20,14 +21,33 @@ logger = logging.getLogger("perception")
 
 async def get_page_state(page: Page, with_screenshot: bool = False) -> PageState:
     t0 = time.perf_counter()
-    raw = await page.evaluate(OBSERVER_JS)
-    elements = [Element(**e) for e in raw]
+    async def observe(frame, index):
+        try:
+            raw = await frame.evaluate(OBSERVER_JS)
+            return [Element(**(e | {"id": f"f{index}:{e['id']}"} if index else e)) for e in raw]
+        except Exception:
+            if index == 0:
+                raise
+            return []  # detached or inaccessible frame
+
+    groups = await asyncio.gather(*(observe(frame, i) for i, frame in enumerate(page.frames)))
+    elements = [e for group in groups for e in group]
     shot = None
     if with_screenshot:
-        png = await page.screenshot(type="jpeg", quality=40, scale="css")
+        png = await page.screenshot(type="jpeg", quality=40, scale="css",
+                                    style="#vox-host { visibility: hidden !important; }")
         import base64
-        shot = base64.b64encode(png).decode()
-    state = PageState(url=page.url, title=await page.title(), elements=elements, screenshot_b64=shot)
+        from io import BytesIO
+        from PIL import Image
+        image = Image.open(BytesIO(png))
+        image.thumbnail((768, 512))
+        buffer = BytesIO()
+        image.save(buffer, format="JPEG", quality=45)
+        shot = base64.b64encode(buffer.getvalue()).decode()
+    summary = await page.evaluate("""() => Array.from(document.querySelectorAll('h1,h2,[role=alert],[role=status]'))
+        .filter(el => {const r=el.getBoundingClientRect(); return r.width && r.height && r.bottom>0 && r.top<innerHeight;})
+        .slice(0,12).map(el => el.innerText.slice(0,120)).join(' | ')""")
+    state = PageState(url=page.url, title=await page.title(), elements=elements, screenshot_b64=shot, summary=summary)
     elapsed_ms = (time.perf_counter() - t0) * 1000
     logger.debug("get_page_state: %d elements in %.1f ms (%s)", len(elements), elapsed_ms, page.url)
     return state
@@ -170,7 +190,7 @@ def _lexical_score(e: Element, words: set[str]) -> int:
     return overlap * 2 + option_overlap * 3 + partial
 
 
-def shortlist(state: PageState, transcript: str, limit: int = 24) -> list[Element]:
+def shortlist(state: PageState, transcript: str, limit: int = 40) -> list[Element]:
     """Ordinal / "next field" matches are pinned first, then role-word filtered + lexical overlap, then viewport."""
     elements = state.elements
     words = _transcript_words(transcript)
@@ -184,7 +204,7 @@ def shortlist(state: PageState, transcript: str, limit: int = 24) -> list[Elemen
 
     def score(e: Element) -> tuple:
         role_mismatch = role_filter is not None and e.role not in role_filter
-        return (role_mismatch, -_lexical_score(e, words), not e.in_viewport)
+        return (role_mismatch, -_lexical_score(e, words), not e.active, not e.in_viewport)
 
     ranked = sorted(elements, key=score)
 
@@ -226,7 +246,7 @@ def _state_suffix(e: Element) -> str:
     if e.href_domain:
         parts.append(f"→{e.href_domain}")
     if e.role == "select" and e.options:
-        parts.append("options=[" + ",".join(e.options[:8]) + "]")
+        parts.append("options=[" + ",".join(e.options[:30]) + "]")
     return (" " + " ".join(parts)) if parts else ""
 
 

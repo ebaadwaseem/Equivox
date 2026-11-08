@@ -181,7 +181,9 @@ def extract_url(transcript: str) -> Optional[str]:
 def extract_select_value(transcript: str) -> Optional[str]:
     """"select Tuesday" -> "Tuesday" """
     m = _SELECT_RE.match(transcript.strip())
-    return m.group(1).strip() if m else None
+    if not m:
+        return None
+    return re.split(r"\s+(?:in|from|for)\s+(?:the\s+)?", m.group(1), maxsplit=1, flags=re.I)[0].strip(" \"'")
 
 
 # ---- scroll: amount is a FRACTION of the scroll container's visible height, not

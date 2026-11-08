@@ -18,6 +18,7 @@ from audio.apple_transcriber import is_available as apple_speech_available
 from audio.transcriber import TypedTranscriber
 from backend import jev, policy, spans
 from backend.context import ConversationContext, Turn
+from backend.clauses import first_clause
 from backend.model import decide
 from backend.scheduler import Scheduler
 from executor import act, undo
@@ -127,18 +128,31 @@ async def main() -> None:
 
         context = ConversationContext()
         latest_raw: dict[int, str] = {}
+        latest_transcripts: dict[int, Transcript] = {}
+        last_heard: dict[int, float] = {}
+        last_audio_at = 0.0
+        page_epoch = 0
+        decision_cache = {}
         action_busy = False
         action_queue: list = []
         action_wake = asyncio.Event()
-        buffered_transcript: Optional[Transcript] = None
+        buffered_transcripts: dict[int, Transcript] = {}
         silence_task: Optional[asyncio.Task] = None
+
+        def quiet_ms(utterance_id) -> float:
+            # Mic levels and transcript changes are separate signals. Missing ASR
+            # updates must not be mistaken for silence in the middle of a query.
+            changed = last_heard.get(utterance_id, time.monotonic())
+            if utterance_id is not None and utterance_id >= 0:
+                changed = max(changed, last_audio_at)
+            return max(0, (time.monotonic() - changed) * 1000)
 
         async def on_new_page(new_page) -> None:
             """Detects popups/new tabs the PAGE itself opened (target=_blank, window.open)
             -- our own act.new_tab() calls also fire this event but have no opener, so
             they're skipped here. Never creates a checkpoint: popups are site-initiated
             by definition, which is exactly what checkpoints must NOT capture."""
-            nonlocal active_page
+            nonlocal active_page, page_epoch
             try:
                 opener = await new_page.opener()
             except Exception:
@@ -146,13 +160,15 @@ async def main() -> None:
             if opener is None:
                 return
             new_page.site_opened = (time.time() - last_command_ts) > SITE_OPENED_WINDOW_S
+            active_page = new_page
+            page_epoch += 1
             try:
                 await new_page.wait_for_load_state("domcontentloaded", timeout=5000)
             except Exception:
                 pass
-            active_page = new_page
             print("  ↗ popup opened:", new_page.url, "(unprompted)" if new_page.site_opened else "")
-            await vox.show_on(active_page)
+            if active_page is new_page:
+                await vox.show_on(new_page)
 
         ctx.on("page", lambda p: asyncio.ensure_future(on_new_page(p)))
 
@@ -163,6 +179,7 @@ async def main() -> None:
 
         async def run_action(d: Decision, target_name: str = "", turn: Optional[Turn] = None) -> None:
             nonlocal active_page, last_scroll
+            action_started = time.perf_counter()
             await mark_user_command()
             try:
                 page_before = {"url": active_page.url, "title": await active_page.title()}
@@ -227,8 +244,12 @@ async def main() -> None:
                     if outcome != "failed":
                         outcome = f"navigated to {_short_url(active_page.url)}"
                 context.finish(turn, outcome)
+                logger.info("action=%s outcome=%s action_ms=%.0f", d.intent, outcome,
+                            (time.perf_counter() - action_started) * 1000)
 
         def submit_call(fn) -> None:
+            nonlocal page_epoch
+            page_epoch += 1
             action_queue.append(fn)
             action_wake.set()
 
@@ -236,7 +257,7 @@ async def main() -> None:
             submit_call(lambda: run_action(d, target_name, turn))
 
         async def action_worker() -> None:
-            nonlocal action_busy, buffered_transcript
+            nonlocal action_busy
             while True:
                 await action_wake.wait()
                 action_wake.clear()
@@ -244,12 +265,17 @@ async def main() -> None:
                     item = action_queue.pop(0)
                     action_busy = True
                     try:
+                        await vox.set_history(active_page, context.history, list(context.turns))
                         await item()
+                    except Exception:
+                        logger.exception("action worker failed")
                     finally:
+                        await vox.set_history(active_page, context.history, list(context.turns))
                         action_busy = False
-                if buffered_transcript is not None:
-                    t, buffered_transcript = buffered_transcript, None
-                    sched.submit(t, force=True)
+                buffered = list(buffered_transcripts.values())
+                buffered_transcripts.clear()
+                for t in buffered:
+                    sched.submit(latest_transcripts.get(t.id, t), force=True)
 
         async def go_back_to(index: int) -> None:
             nonlocal active_page
@@ -317,7 +343,7 @@ async def main() -> None:
                 sched.submit(
                     Transcript(
                         text=raw_text, is_final=False, confidence=t.confidence,
-                        id=utterance_id, silent_ms=float(policy.SILENCE_COMPLETE_MS),
+                        id=utterance_id, silent_ms=quiet_ms(utterance_id),
                     ),
                     force=True,
                 )
@@ -325,14 +351,17 @@ async def main() -> None:
             silence_task = asyncio.create_task(fire())
 
         async def handle(t: Transcript) -> None:
-            nonlocal pending, listening_paused, buffered_transcript, silence_task
+            nonlocal pending, listening_paused, silence_task
             t_start = time.perf_counter()
             if silence_task and not silence_task.done():
                 silence_task.cancel()
                 silence_task = None
 
             physical_id = t.id
-            raw_text = t.text
+            raw_text = " ".join(t.text.split())
+            t = Transcript(raw_text, t.is_final, t.confidence, t.id, t.silent_ms)
+            # Keep the physical transcript throughout buffering and continuation.
+            physical = t
             sliced = False
             if physical_id is not None:
                 current, virtual_id = context.slice(physical_id, raw_text)
@@ -347,9 +376,19 @@ async def main() -> None:
                         id=virtual_id, silent_ms=t.silent_ms,
                     )
 
+            remainder = t.text
+            clause, clause_end, bounded = first_clause(remainder)
+            offset = len(" ".join(raw_text.split())) - len(remainder)
+            prefix = " ".join(raw_text.split())[:offset + clause_end]
+            t = Transcript(clause, t.is_final, t.confidence, physical_id, t.silent_ms)
+            consumed_gen = context.generation(physical_id)
+            if action_busy or action_queue:
+                buffered_transcripts[physical_id] = physical
+                return
+            request_epoch = page_epoch
+            request_page = active_page
             text_norm = t.text.strip().lower()
-            display = f"{context.active_prefix} · {t.text}" if sliced and context.active_prefix else t.text
-            await vox.set(active_page, "listening", display)
+            await vox.set(active_page, "listening", raw_text)
 
             # Captured before the confirm branch below may clear `pending`, so the model
             # still sees what the user was asked to confirm when they reply with something
@@ -359,8 +398,12 @@ async def main() -> None:
                 pending_confirmation = vox.describe_action(pending["decision"], pending.get("target_name", ""))
 
             def _executed_prefix(t: Transcript, d: Decision) -> str:
-                start = len(context.active_prefix or "") if context.consumed_id == physical_id else 0
-                return _consumed_prefix(raw_text, t.text, d.act_now, t.is_final, start)
+                return prefix
+
+            def consume_and_continue() -> None:
+                context.consume(physical_id, prefix)
+                # Even a single final containing several clauses must drain itself.
+                buffered_transcripts[physical_id] = latest_transcripts.get(physical_id, physical)
 
             # UI-only meta-commands: deterministic, never go through Jev.
             if text_norm in PAUSE_LISTENING_PHRASES or (
@@ -397,13 +440,13 @@ async def main() -> None:
             # explicit phrases skip inference entirely
             if text_norm in PREV_TAB_PHRASES:
                 turn = context.commit(t.text, Decision(True, "switch_tab", text="previous"), "previous tab")
-                context.consume(physical_id, t.text)
+                consume_and_continue()
                 submit_action(Decision(True, "switch_tab", text="previous"), "previous tab", turn)
                 pending = None
                 return
             if text_norm in PREV_PAGE_PHRASES:
                 turn = context.commit(t.text, Decision(True, "back"), "previous page")
-                context.consume(physical_id, t.text)
+                consume_and_continue()
 
                 async def undo_same_tab() -> None:
                     try:
@@ -417,7 +460,7 @@ async def main() -> None:
                 return
             if text_norm in UNDO_PHRASES:
                 turn = context.commit(t.text, Decision(True, "back"), "undo")
-                context.consume(physical_id, t.text)
+                consume_and_continue()
 
                 async def undo_last() -> None:
                     try:
@@ -432,7 +475,7 @@ async def main() -> None:
             if spans.is_scroll_repeat(t.text):
                 repeat_decision = last_scroll or Decision(True, "scroll", scroll_amount=spans.DEFAULT_SCROLL_FRACTION)
                 turn = context.commit(t.text, repeat_decision)
-                context.consume(physical_id, t.text)
+                consume_and_continue()
                 submit_action(repeat_decision, "", turn)
                 pending = None
                 return
@@ -442,11 +485,18 @@ async def main() -> None:
                     d = pending["decision"]
                     said = pending.get("said", t.text)
                     turn = context.commit(said, d, pending.get("target_name", ""))
-                    context.consume(pending.get("physical_id"), pending.get("prefix") or said)
+                    confirmed_id = pending.get("physical_id")
+                    context.consume(confirmed_id, pending.get("prefix") or said)
+                    if confirmed_id in latest_transcripts:
+                        buffered_transcripts[confirmed_id] = latest_transcripts[confirmed_id]
+                    context.consume(physical_id, prefix)
                     submit_action(d, pending.get("target_name", ""), turn)
                     pending = None
                     return
                 if text_norm in DENY:
+                    cancelled_id = pending.get("physical_id")
+                    context.consume(cancelled_id, latest_raw.get(cancelled_id, pending.get("said", "")))
+                    context.consume(physical_id, prefix)
                     print("  ✗ cancelled")
                     await vox.set(active_page, "idle")
                     pending = None
@@ -462,7 +512,11 @@ async def main() -> None:
                     d.ambiguous = False
                     said = pending.get("said", t.text)
                     turn = context.commit(said, d, candidates[n - 1].name)
-                    context.consume(pending.get("physical_id"), pending.get("prefix") or said)
+                    confirmed_id = pending.get("physical_id")
+                    context.consume(confirmed_id, pending.get("prefix") or said)
+                    if confirmed_id in latest_transcripts:
+                        buffered_transcripts[confirmed_id] = latest_transcripts[confirmed_id]
+                    context.consume(physical_id, prefix)
                     pending = None
                     submit_action(d, candidates[n - 1].name, turn)
                     return
@@ -487,44 +541,77 @@ async def main() -> None:
                     return
                 pending = None  # fall through and treat this as a new command
 
-            if action_busy or action_queue:
-                buffered_transcript = t
-                return
-
             # Only switch to "thinking" once the utterance is final, and keep its words
             # on screen -- doing this per partial made the panel strobe between
             # Listening/Thinking (and blank the transcript) while the user was talking.
             if t.is_final:
-                await vox.set(active_page, "thinking", t.text)
-            state = await get_page_state(active_page)
+                await vox.set(active_page, "thinking", raw_text)
+            snapshot_started = time.perf_counter()
+            if os.getenv("VB_VISION") == "1":
+                state = await get_page_state(request_page, with_screenshot=True)
+            else:
+                state = await get_page_state(request_page)
             cands = shortlist(state, t.text)
-            viewport = active_page.viewport_size
+            viewport = request_page.viewport_size
             vp = (viewport["width"], viewport["height"]) if viewport else None
             prompt_text = to_prompt_text(cands, vp)
-            page_info = {"url": state.url, "title": state.title, "site": _site_of(state.url)}
+            snapshot_ms = (time.perf_counter() - snapshot_started) * 1000
+            page_info = {"url": state.url, "title": state.title, "site": _site_of(state.url),
+                         "summary": getattr(state, "summary", ""),
+                         "screenshot_b64": getattr(state, "screenshot_b64", None),
+                         "tabs": [p.url for p in getattr(ctx, "pages", [])]}
 
             decide_t0 = time.perf_counter()
-            d = await decide(
-                t.text, t.is_final, prompt_text, cands,
-                page=page_info, context=context,
-                pending_confirmation=pending_confirmation, silent_ms=t.silent_ms,
-            )
+            cache_key = (physical_id, consumed_gen, page_epoch, t.text, prompt_text,
+                         state.url, state.title, page_info["summary"], page_info["screenshot_b64"],
+                         pending_confirmation, context.encode())
+            cached = decision_cache.get(physical_id)
+            if t.silent_ms and cached and cached[0] == cache_key:
+                d = cached[1]
+            else:
+                d = await decide(
+                    t.text, t.is_final, prompt_text, cands,
+                    page=page_info, context=context,
+                    pending_confirmation=pending_confirmation, silent_ms=t.silent_ms,
+                )
+                # The no-key fallback deliberately waits for final/silence and
+                # needs to be evaluated again when that input changes.
+                if os.getenv("OPENROUTER_API_KEY") and os.getenv("VB_MODEL"):
+                    decision_cache[physical_id] = (cache_key, d)
             decide_ms = (time.perf_counter() - decide_t0) * 1000
 
+            if bounded:
+                d.payload_bounded = True
+                if d.act_now in {"clause_complete", "utterance_complete"}:
+                    d.act_now = "clause_complete"
+            # Epoch increments at reservation, before the browser action starts.
+            # Reject decisions that saw a different page or an already consumed clause.
+            if context.generation(physical_id) != consumed_gen:
+                return
+            if request_epoch != page_epoch or request_page is not active_page:
+                buffered_transcripts[physical_id] = latest_transcripts.get(physical_id, physical)
+                if not action_busy and not action_queue:
+                    sched.submit(buffered_transcripts.pop(physical_id), force=True)
+                return
             target_name = _target_name(d, cands)
             stale = False
             if physical_id is not None:
-                latest = latest_raw.get(physical_id)
-                stale = latest is not None and " ".join(latest.split()) != " ".join(raw_text.split())
-            if physical_id is not None and context.was_consumed(physical_id, t.text):
-                return
+                latest = latest_raw.get(physical_id, raw_text)
+                latest_current, _ = context.slice(physical_id, latest)
+                # A later clause may arrive during inference. A bounded first
+                # clause is unchanged and safe to commit; a revised payload isn't.
+                latest_clause = first_clause(latest_current)[0] if latest_current else None
+                stale = latest_clause != t.text
+                if stale:
+                    return
 
-            result = policy.evaluate(d, t.is_final, silent_ms=t.silent_ms, stale=stale)
+            silent_ms = quiet_ms(physical_id)
+            result = policy.evaluate(d, t.is_final, silent_ms=silent_ms, stale=stale)
             outcome = result.outcome
             logger.info(
-                "transcript=%r final=%s stale=%s -> %s intent=%s target=%s conf=%.2f decide_ms=%.0f total_ms=%.0f",
+                "transcript=%r final=%s stale=%s -> %s intent=%s target=%s conf=%.2f snapshot_ms=%.0f decide_ms=%.0f total_ms=%.0f",
                 t.text, t.is_final, stale, outcome, d.intent, d.target_id, d.confidence,
-                decide_ms, (time.perf_counter() - t_start) * 1000,
+                snapshot_ms, decide_ms, (time.perf_counter() - t_start) * 1000,
             )
 
             if outcome == "IGNORE":
@@ -573,7 +660,7 @@ async def main() -> None:
             if outcome == "COMMIT":
                 pending = None  # a fresh command supersedes any confirmation still open
                 turn = context.commit(t.text, d, target_name)
-                context.consume(physical_id, _executed_prefix(t, d))
+                consume_and_continue()
                 submit_action(d, target_name, turn)
 
         sched = Scheduler(handle)
@@ -620,6 +707,9 @@ async def main() -> None:
                       "Falling back to typed input only.")
             else:
                 async def on_mic_level(value: float) -> None:
+                    nonlocal last_audio_at
+                    if not listening_paused and value > 0.05:
+                        last_audio_at = time.monotonic()
                     await vox.set_level(active_page, value)
 
                 async def on_mic_status(kind: str, detail: str) -> None:
@@ -638,9 +728,19 @@ async def main() -> None:
 
                 tasks.append(asyncio.create_task(feed_apple()))
 
+        input_serial = 0
         try:
             while True:
                 t = await input_queue.get()
+                if t.id is None:
+                    input_serial -= 1
+                    t.id = input_serial
+                latest_transcripts[t.id] = t
+                if latest_raw.get(t.id) != t.text:
+                    last_heard[t.id] = time.monotonic()
+                    if silence_task:
+                        silence_task.cancel()
+                        silence_task = None
                 # Echo mic partials immediately, outside the decision pipeline: a
                 # cancelled stale decision never reaches vox.set(), so the live
                 # transcript would otherwise lag exactly when speech is fastest.
@@ -648,10 +748,27 @@ async def main() -> None:
                     latest_raw[t.id] = t.text
                     if not t.is_final:
                         await vox.set(active_page, "listening", t.text)
-                sched.submit(t)
+                # The input path also buffers immediately; no scheduler coalescing
+                # can drop a separate utterance while navigation is running.
+                if action_busy or action_queue:
+                    buffered_transcripts[t.id] = t
+                else:
+                    sched.submit(t)
+                # Bound recognizer metadata without losing queued utterances.
+                if len(latest_raw) > 128:
+                    oldest = next(iter(latest_raw))
+                    if oldest not in buffered_transcripts:
+                        latest_raw.pop(oldest, None)
+                        latest_transcripts.pop(oldest, None)
+                        last_heard.pop(oldest, None)
+                        decision_cache.pop(oldest, None)
         finally:
             for task in tasks:
                 task.cancel()
+            if silence_task:
+                silence_task.cancel()
+            await sched.aclose()
+            await asyncio.gather(*tasks, return_exceptions=True)
             await jev.aclose()
 
 

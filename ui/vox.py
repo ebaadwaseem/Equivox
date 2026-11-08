@@ -9,6 +9,7 @@ which page is "active" (new tab / tab switch). Never raises -- a missing overlay
 import asyncio
 import logging
 import re
+import weakref
 from pathlib import Path
 
 from playwright.async_api import Page
@@ -52,7 +53,17 @@ def is_show_command(text: str) -> bool:
 _current: tuple[str, str] = ("idle", "")
 _minimized = False
 _version = 0
-_wired_pages: set[int] = set()
+_wired_pages = weakref.WeakSet()
+_history: list[dict] = []
+
+
+async def set_history(page: Page, turns, context_turns) -> None:
+    """Retain the session trail across documents, with the exact model window marked."""
+    global _history
+    context_ids = {id(t) for t in context_turns}
+    _history = [dict(said=t.said, action=t.intent, target=t.target, text=t.text,
+                     outcome=t.outcome, in_context=id(t) in context_ids) for t in turns]
+    await _apply(page)
 
 
 async def install(context) -> None:
@@ -189,17 +200,22 @@ async def _apply(page: Page) -> None:
     state, text = _current
     try:
         await page.evaluate(
-            "([s, t, m]) => window.__vox && window.__vox.set(s, t, undefined, m)",
-            [state, text, _minimized],
+            "([s, t, m, h]) => { if (window.__vox) { window.__vox.set(s, t, undefined, m); "
+            "if (window.__vox.setHistory) window.__vox.setHistory(h); } }",
+            [state, text, _minimized, _history],
         )
     except Exception as e:
         logger.debug("overlay apply skipped: %s", e)
 
 
 async def _wire(page: Page) -> None:
-    if id(page) in _wired_pages:
+    if page in _wired_pages:
         return
-    _wired_pages.add(id(page))
+    _wired_pages.add(page)
+    try:
+        await page.evaluate(OVERLAY_JS)
+    except Exception as e:
+        logger.debug("overlay mount skipped: %s", e)
 
     def _on_load(_page: Page) -> None:
         asyncio.ensure_future(_apply(page))

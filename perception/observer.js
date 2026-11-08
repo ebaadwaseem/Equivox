@@ -1,7 +1,7 @@
 // PERSON 2: injected into the page. Returns interactable elements with stable ids.
 () => {
   const SELECTOR = 'a[href], button, input, textarea, select, [role=button], [role=link], ' +
-                   '[role=tab], [role=menuitem], [role=checkbox], [role=radio], [onclick], [contenteditable=true]';
+                   '[role=tab], [role=menuitem], [role=checkbox], [role=radio], [role=textbox], [role=searchbox], [role=combobox], [role=listbox], [role=option], [onclick], [contenteditable]:not([contenteditable=false])';
   const ROLE_PRIORITY = ['textbox', 'checkbox', 'radio', 'button', 'select', 'tab', 'menuitem', 'link'];
   window.__vbNext = window.__vbNext || 1;
 
@@ -20,7 +20,8 @@
     if (!(r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth)) return false;
     const cx = Math.min(Math.max(r.x + r.width / 2, 0), innerWidth - 1);
     const cy = Math.min(Math.max(r.y + r.height / 2, 0), innerHeight - 1);
-    const top = document.elementFromPoint(cx, cy);
+    const root = el.getRootNode();
+    const top = (root.elementFromPoint ? root : document).elementFromPoint(cx, cy);
     if (!top) return false;
     // the voice-assistant overlay sits on top visually but must never block real clicks
     if (top.id === 'vox-host') return false;
@@ -29,6 +30,8 @@
 
   function roleOf(el, tag) {
     const ariaRole = el.getAttribute('role');
+    if (ariaRole === 'combobox' || ariaRole === 'listbox') return 'select';
+    if (ariaRole === 'searchbox' || el.isContentEditable) return 'textbox';
     if (ariaRole) return ariaRole;
     if (tag === 'a') return 'link';
     if (tag === 'select') return 'select';
@@ -59,13 +62,13 @@
     const labelledby = el.getAttribute('aria-labelledby');
     if (labelledby) {
       const txt = labelledby.split(/\s+/)
-        .map((id) => { const n = document.getElementById(id); return n ? n.innerText : ''; })
+        .map((id) => { const n = el.getRootNode().getElementById(id); return n ? n.innerText : ''; })
         .join(' ');
       if (clean(txt)) return clean(txt);
     }
 
     if (el.id) {
-      const lbl = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+      const lbl = el.getRootNode().querySelector(`label[for="${CSS.escape(el.id)}"]`);
       if (lbl) { const txt = clean(lbl.innerText); if (txt) return txt; }
     }
 
@@ -84,7 +87,7 @@
       if (img && clean(img.alt)) return clean(img.alt);
     }
 
-    const innerTxt = clean(el.innerText);
+    const innerTxt = tag === 'select' || el.isContentEditable ? '' : clean(el.innerText);
     if (innerTxt) return innerTxt;
 
     const placeholder = el.getAttribute('placeholder');
@@ -125,6 +128,8 @@
       const opt = el.options[el.selectedIndex];
       return opt ? clean(opt.text) : null;
     }
+    if (type === 'password') return null;
+    if (el.isContentEditable) return clean(el.innerText);
     if (tag === 'textarea' || (tag === 'input' && !['checkbox', 'radio', 'submit', 'button', 'reset'].includes(type))) {
       return el.value != null ? String(el.value).slice(0, 80) : null;
     }
@@ -146,7 +151,13 @@
                                // search-result tiles commonly wrap the title, a thumbnail, the
                                // URL text, and the snippet in separate <a> tags to the same href.
 
-  for (const el of document.querySelectorAll(SELECTOR)) {
+  function* candidates(root) {
+    yield* root.querySelectorAll(SELECTOR);
+    for (const host of root.querySelectorAll('*')) {
+      if (host.id !== 'vox-host' && host.shadowRoot) yield* candidates(host.shadowRoot);
+    }
+  }
+  for (const el of candidates(document)) {
     // the overlay lives in a Shadow DOM so document.querySelectorAll can never actually
     // see inside it, but skip defensively in case that ever changes.
     if (el.id === 'vox-host' || (el.closest && el.closest('#vox-host'))) continue;
@@ -204,7 +215,7 @@
       href_domain: role === 'link' ? hrefDomain(el) : null,
       is_homepage_link: role === 'link' ? isHomepageLink(el) : false,
       active: el === document.activeElement,
-      options: tag === 'select' ? Array.from(el.options).slice(0, 20).map((o) => clean(o.text)) : [],
+      options: tag === 'select' ? Array.from(el.options).filter(o => !o.disabled).slice(0, 100).map((o) => clean(o.text)) : [],
       // semantic landmarks catch well-built pages; the class/id patterns catch the common
       // case of a plain <div class="header">/"navbar" with no real HTML5 semantics (e.g. DDG)
       in_chrome: !!el.closest(

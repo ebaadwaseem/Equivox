@@ -8,7 +8,7 @@
 //
 // Public API: window.__vox = { set(state, text, level, minimized), setLevel(level) }
 (() => {
-  if (window.__voxMounting) return;
+  if (window.__voxMounting && (!window.__vox || document.getElementById("vox-host"))) return;
   window.__voxMounting = true;
 
   const STATES = {
@@ -112,17 +112,13 @@
       }
 
       /* ---------- live transcript: word-diffing ---------- */
-      /* max 2 lines; a soft mask (not a hard clip) fades out whatever scrolls past the
-         top edge, so overflow feels like it's continuously scrolling up rather than
-         getting chopped off. */
+      /* Several readable lines; long utterances can be scrolled without losing text. */
       .panel .text {
         font-size: 20px; font-weight: 600; text-shadow: 0 1px 0 rgba(255,255,255,.8); margin-top: 4px; color: #06182b;
-        min-height: 1.4em; max-height: 2.8em; line-height: 1.4em; overflow: hidden; position: relative;
+        min-height: 1.4em; max-height: 7em; line-height: 1.4em; overflow: auto; overflow-wrap: anywhere; position: relative;
         /* click-through by default (it's just text); only the editable state below
            opts in, because that's what reveals the typed-command box. */
         pointer-events: none; cursor: default;
-        -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 1.1em, #000 100%);
-        mask-image: linear-gradient(to bottom, transparent 0, #000 1.1em, #000 100%);
         transition: opacity .12s ease;
       }
       .panel .text.crossfade-out { opacity: 0; }
@@ -132,9 +128,10 @@
       }
       .panel .text .w.enter { opacity: 0; transform: translateY(5px); }
       .panel .text .w.tail { opacity: .65; } /* last 2 words of a live partial -- still uncertain */
+      .panel .text[data-scrollable="1"] { pointer-events: auto; }
 
       /* when the text isn't echoing live speech it doubles as a "type instead" button */
-      .panel .text[data-editable="1"] { pointer-events: auto; cursor: text; }
+      .panel .text[data-editable="1"] .w { pointer-events: auto; cursor: text; }
       .panel .text[data-editable="1"]:hover { text-decoration: underline dotted rgba(13,79,122,.45); text-underline-offset: 4px; }
       .panel .text[data-editable="1"]:focus-visible { outline: 2px solid #2f9be0; outline-offset: 3px; border-radius: 6px; }
 
@@ -148,7 +145,7 @@
 
       /* ---------- frosted transcript panel (Frutiger Aero) ---------- */
       .panel {
-        width: min(360px, 60vw); padding: 14px 18px; border-radius: 18px; position: relative; overflow: hidden;
+        width: min(440px, 70vw); max-height: calc(100vh - 32px); padding: 14px 18px; border-radius: 18px; position: relative; overflow: auto;
         /* Frutiger Aero frosted glass: light aqua/mint tint, a little see-through */
         background: linear-gradient(180deg, rgba(255,255,255,.80) 0%, rgba(232,248,255,.72) 55%, rgba(214,244,236,.70) 100%);
         backdrop-filter: blur(16px) saturate(160%); -webkit-backdrop-filter: blur(16px) saturate(160%);
@@ -167,10 +164,23 @@
       .panel .hide { position: absolute; top: 8px; right: 10px; width: 26px; height: 26px; border-radius: 50%;
         border: 1px solid rgba(255,255,255,.7); background: rgba(255,255,255,.4); color: #0b2540;
         font-size: 16px; line-height: 1; cursor: pointer; pointer-events: auto; z-index: 2; }
+      .activity { pointer-events: none; font: 13px/1.45 system-ui; color: #173c54; margin-top: 10px; }
+      .activity[open] { pointer-events: auto; }
+      .activity summary { pointer-events: auto; width: fit-content; cursor: pointer; padding: 4px 0; }
+      .history-key { font-size: 11px; opacity: .7; margin: 5px 0; }
+      .activity ol { list-style: none; padding: 0; margin: 0; max-height: min(32vh, 260px); overflow: auto; overscroll-behavior: contain; }
+      .activity li { padding: 7px 9px; margin: 4px 0; border-left: 2px solid transparent; border-radius: 5px; overflow-wrap: anywhere; }
+      .activity li[data-context="true"] { border-color: #3698b7; background: rgba(255,255,255,.4); }
+      .activity .outcome { display: block; font-size: 11px; opacity: .7; }
       /* minimized: panel gone, small droplet only; click it to restore */
       .stage.min .panel { display: none; }
       .stage.min .vox { width: 40px; height: 40px; cursor: pointer; pointer-events: auto; } /* scaled with our 110px (not the source's 180px) mascot */
       .stage.min .vox .q, .stage.min .vox .ring { display: none; }
+      @media (max-width: 600px) {
+        .stage { gap: 8px; }
+        .vox { width: 64px; height: 64px; margin: 4px; }
+        .panel { width: calc(100vw - 120px); }
+      }
       .panel .text  { font-size: 20px; font-weight: 600; text-shadow: 0 1px 0 rgba(255,255,255,.8); margin-top: 4px; color: #06182b; min-height: 1.4em; }
 
       /* Hidden by default: the panel's text IS the live transcript. Clicking the text
@@ -212,6 +222,11 @@
         <button class="hide" id="hide" aria-label="Hide Vox" title="Hide (or say 'hide Vox')">–</button>
         <div class="label" id="label">Idle</div>
         <div class="text" id="text"><span id="text-inner"></span></div>
+        <details class="activity" id="activity">
+          <summary>Recent speech &amp; actions <span id="activity-count"></span></summary>
+          <div class="history-key">Highlighted rows are included in decision context</div>
+          <ol id="activity-list"></ol>
+        </details>
         <div class="sr-only" id="sr-live" aria-live="polite" aria-atomic="true"></div>
         <div class="cmd-row">
           <input id="cmd-input" type="text" placeholder="Type a command…" aria-label="Type a voice command" />
@@ -342,10 +357,11 @@
       words.forEach((word, i) => {
         const span = document.createElement("span");
         span.className = "w" + (tailCount && i >= words.length - tailCount ? " tail" : "");
-        span.textContent = word;
+        span.textContent = word + " ";
         textInnerEl.appendChild(span);
       });
-      textEl.scrollTop = textEl.scrollHeight; // pin to the latest 2 lines; the CSS mask softens the rest
+      textEl.dataset.scrollable = textEl.scrollHeight > textEl.clientHeight + 1 ? "1" : "0";
+      textEl.scrollTop = textEl.scrollHeight;
     }
 
     // crossfadeWords() writes the DOM from a delayed setTimeout, not immediately --
@@ -375,11 +391,11 @@
         if (!span) {
           span = document.createElement("span");
           span.className = "w enter";
-          span.textContent = word;
+          span.textContent = word + " ";
           textInnerEl.appendChild(span);
           requestAnimationFrame(() => span.classList.remove("enter"));
-        } else if (span.textContent !== word) {
-          span.textContent = word;
+        } else if (span.textContent !== word + " ") {
+          span.textContent = word + " ";
           span.classList.remove("enter");
           void span.offsetWidth; // restart the transition
           span.classList.add("enter");
@@ -388,6 +404,7 @@
         span.classList.toggle("tail", isTail);
       });
       for (let i = existing.length - 1; i >= words.length; i--) existing[i].remove();
+      textEl.dataset.scrollable = textEl.scrollHeight > textEl.clientHeight + 1 ? "1" : "0";
       textEl.scrollTop = textEl.scrollHeight;
     }
 
@@ -602,7 +619,29 @@
       voxEl.style.setProperty("--level", String(Math.max(0, Math.min(1, level))));
     }
 
-    window.__vox = { set: setVoxState, setLevel };
+    let historySignature = "";
+    function setHistory(rows) {
+      const signature = JSON.stringify(rows);
+      if (signature === historySignature) return;
+      historySignature = signature;
+      const list = shadow.getElementById("activity-list");
+      const atBottom = list.scrollHeight - list.clientHeight - list.scrollTop < 20;
+      list.replaceChildren();
+      for (const row of rows) {
+        const li = document.createElement("li");
+        li.dataset.context = String(row.in_context);
+        const said = document.createElement("div");
+        said.textContent = row.said;
+        const outcome = document.createElement("span");
+        outcome.className = "outcome";
+        outcome.textContent = [row.action, row.target || row.text, row.outcome].filter(Boolean).join(" · ");
+        li.append(said, outcome);
+        list.append(li);
+      }
+      shadow.getElementById("activity-count").textContent = rows.length ? `(${rows.length})` : "";
+      if (atBottom) list.scrollTop = list.scrollHeight;
+    }
+    window.__vox = { set: setVoxState, setLevel, setHistory };
     setVoxState("idle");
   }
 

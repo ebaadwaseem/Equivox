@@ -10,7 +10,7 @@ from typing import Optional
 
 from shared.protocol import Decision
 
-MAX_TURNS = 6
+MAX_TURNS = 12
 
 
 @dataclass
@@ -23,18 +23,20 @@ class Turn:
     ts: float = field(default_factory=time.time)
 
     def encode(self) -> str:
-        parts = [f'said="{self.said[:120]}"', f"intent={self.intent or 'none'}"]
+        parts = [f'said="{self.said[:240]}"', f"intent={self.intent or 'none'}"]
         if self.target:
             parts.append(f'target="{self.target[:80]}"')
         if self.text:
-            parts.append(f'text="{self.text[:80]}"')
-        parts.append(f"outcome={self.outcome}")
+            parts.append(f'text="{self.text[:240]}"')
+        parts.append(f"outcome={self.outcome[:240]}")
         return "; ".join(parts)
 
 
 class ConversationContext:
     def __init__(self, max_turns: int = MAX_TURNS):
         self.turns: deque[Turn] = deque(maxlen=max_turns)
+        self.history: deque[Turn] = deque(maxlen=100)
+        self._consumed: dict[int, tuple[str, int]] = {}
         self.previous_page: Optional[dict] = None
         self.active_prefix: Optional[str] = None
         self.consumed_id: Optional[int] = None
@@ -49,6 +51,7 @@ class ConversationContext:
             outcome=outcome,
         )
         self.turns.append(turn)
+        self.history.append(turn)
         return turn
 
     def finish(self, turn: Turn, outcome: str) -> None:
@@ -63,35 +66,50 @@ class ConversationContext:
             return
         self.active_prefix = " ".join(said.split()).lower()
         self.consumed_id = utterance_id
-        self.consumed_gen += 1
+        self.consumed_gen = self.generation(utterance_id) + 1
+        self._consumed[utterance_id] = (self.active_prefix, self.consumed_gen)
+        if len(self._consumed) > 128:
+            del self._consumed[next(iter(self._consumed))]
+
+    def generation(self, utterance_id) -> int:
+        return self._consumed.get(utterance_id, ("", 0))[1]
 
     def slice(self, utterance_id: Optional[int], text: str) -> tuple[Optional[str], Optional[int | str]]:
         """Return (current command, virtual id). None means the recognizer rewrote words
         already executed, or too little new text remains to be a command."""
-        if utterance_id is None or self.consumed_id != utterance_id or not self.active_prefix:
+        prefix, gen = self._consumed.get(utterance_id, ("", 0))
+        if not prefix:
             return text, utterance_id
 
         normalized = " ".join(text.split())
-        prefix = self.active_prefix
-        if not self._starts_with_prefix(normalized, prefix):
+        end = self._prefix_end(normalized, prefix)
+        if end is None:
             return None, utterance_id
-        remainder = normalized[len(prefix):].lstrip(" ,;.!?-")
-        remainder = re.sub(r"^(?:(?:and|now|then|also|please)\b[\s,;]*)+", "", remainder, flags=re.I)
-        if len(remainder.split()) < 2:
+        remainder = normalized[end:].lstrip(" ,;.!?-")
+        remainder = re.sub(r"^(?:(?:and|now|then|also|please|okay|ok)\b[\s,;]*)+", "", remainder, flags=re.I)
+        if not remainder or (len(remainder.split()) < 2 and remainder.lower() not in {"back", "forward", "undo", "more", "again"}):
             return None, utterance_id
-        return remainder, f"{utterance_id}+{self.consumed_gen}"
+        return remainder, f"{utterance_id}+{gen}"
 
     def was_consumed(self, utterance_id: Optional[int], text: str) -> bool:
-        if utterance_id is None or self.consumed_id != utterance_id or not self.active_prefix:
+        prefix, _ = self._consumed.get(utterance_id, ("", 0))
+        if not prefix:
             return False
-        return self._starts_with_prefix(" ".join(text.split()), self.active_prefix)
+        return self._starts_with_prefix(" ".join(text.split()), prefix)
 
     @staticmethod
     def _starts_with_prefix(text: str, prefix: str) -> bool:
-        lower = text.lower()
-        if not lower.startswith(prefix):
-            return False
-        return len(lower) == len(prefix) or not lower[len(prefix)].isalnum()
+        return ConversationContext._prefix_end(text, prefix) is not None
+
+    @staticmethod
+    def _prefix_end(text: str, prefix: str) -> Optional[int]:
+        # Apple revises punctuation between partial/final results. Compare words
+        # while preserving the newest transcript's character offsets for slicing.
+        words = list(re.finditer(r"\w+(?:['’]\w+)*", text.lower()))
+        consumed = re.findall(r"\w+(?:['’]\w+)*", prefix.lower())
+        if not consumed or [w.group() for w in words[:len(consumed)]] != consumed:
+            return None
+        return words[len(consumed) - 1].end()
 
     def encode(self) -> str:
         lines = []

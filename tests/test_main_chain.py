@@ -61,6 +61,9 @@ class FakeState:
 
 
 def _install(monkeypatch, fake_decide, fake_execute, transcripts):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("VB_MODEL", "typesafe/jev-test")
+    monkeypatch.setenv("VB_TRANSCRIBER", "typed")
     async def fake_get_page_state(target_page):
         return FakeState()
 
@@ -77,7 +80,7 @@ def _install(monkeypatch, fake_decide, fake_execute, transcripts):
     monkeypatch.setattr(main, "apple_speech_available", lambda: False)
     monkeypatch.setattr(main.jev, "aclose", noop)
     monkeypatch.setattr(main.undo, "push_checkpoint", noop)
-    for name in ("install", "set", "set_then_idle_after", "show_on", "hide", "show", "set_level"):
+    for name in ("install", "set", "set_then_idle_after", "show_on", "hide", "show", "set_level", "set_history"):
         monkeypatch.setattr(main.vox, name, noop)
     monkeypatch.setattr(main.vox, "current_state", lambda: "idle")
     monkeypatch.setattr(main.vox, "is_hide_command", lambda text: False)
@@ -148,7 +151,7 @@ def test_search_then_scroll_runs_scroll_against_the_loaded_results_page(monkeypa
 
     _run_until(done)
 
-    assert decided == ["search for pizza, and scroll down", "scroll down"]
+    assert decided == ["search for pizza", "scroll down"]
     assert executed == [
         ("search", "https://news.ycombinator.com"),
         ("scroll", "https://results.example"),
@@ -204,7 +207,7 @@ def test_partial_waits_then_silence_retry_acts(monkeypatch):
         decided.append(silent_ms)
         if silent_ms >= 120:
             return _act("search", text="pizza", payload_bounded=True, act_now="utterance_complete")
-        return _act("search", text="pizza", act_now="incomplete", complete=False)
+        return _act("search", text="pizza", act_now="clause_complete")
 
     async def fake_execute(target_page, d):
         executed.append(d.text)
@@ -219,4 +222,153 @@ def test_partial_waits_then_silence_retry_acts(monkeypatch):
 
     assert executed == ["pizza"]
     assert decided[0] < 120
-    assert any(ms >= 120 for ms in decided)
+    # Unchanged state can reuse the first Jev decision at the silence deadline.
+    assert len(decided) == 1
+
+
+def test_single_final_drains_all_clauses_without_more_input(monkeypatch):
+    executed = []
+    decided = []
+    done = asyncio.Event()
+
+    async def fake_decide(text, *args, **kwargs):
+        decided.append(text)
+        if text.startswith("search"):
+            return _act("search", text="clinics in edmonton", act_now="utterance_complete")
+        return _act("scroll", scroll_amount=.8, act_now="utterance_complete")
+
+    async def fake_execute(page, d):
+        executed.append((d.intent, page.url))
+        if d.intent == "search":
+            await asyncio.sleep(.1)
+            page.url = "https://results.example"
+        else:
+            done.set()
+        return "done"
+
+    _install(monkeypatch, fake_decide, fake_execute, [
+        (0, Transcript("search for clinics in edmonton then scroll down", True)),
+    ])
+    _run_until(done)
+    assert decided == ["search for clinics in edmonton", "scroll down"]
+    assert executed[-1] == ("scroll", "https://results.example")
+
+
+def test_three_part_prompt_opens_tab_while_search_is_still_being_spoken(monkeypatch):
+    executed = []
+    done = asyncio.Event()
+
+    async def fake_decide(text, *args, **kwargs):
+        if text == "open a new tab":
+            return _act("new_tab", act_now="clause_complete")
+        if text.startswith("search"):
+            return _act("search", text="physiotherapy clinics in edmonton", act_now="clause_complete")
+        return _act("scroll", scroll_amount=.8, act_now="clause_complete")
+
+    async def new_tab(ctx, url=None):
+        page = FakePage()
+        page.url = "about:blank"
+        executed.append(("new_tab", page.url))
+        return page
+
+    async def fake_execute(page, d):
+        executed.append((d.intent, page.url))
+        if d.intent == "search":
+            await asyncio.sleep(.15)
+            page.url = "https://results.example"
+        else:
+            done.set()
+        return "done"
+
+    _install(monkeypatch, fake_decide, fake_execute, [
+        (0, Transcript("open a new tab", False, id=1)),
+        (.2, Transcript("open a new tab then search for physiotherapy clinics", False, id=1)),
+        (.15, Transcript("open a new tab then search for physiotherapy clinics in edmonton okay now scroll down", True, id=1)),
+    ])
+    monkeypatch.setattr(main.act, "new_tab", new_tab)
+    _run_until(done)
+    assert executed == [("new_tab", "about:blank"), ("search", "about:blank"), ("scroll", "https://results.example")]
+
+
+def test_separate_commands_during_navigation_are_not_overwritten(monkeypatch):
+    executed = []
+    done = asyncio.Event()
+
+    async def fake_decide(text, *args, **kwargs):
+        if text.startswith("search"):
+            return _act("search", text="pizza", act_now="utterance_complete")
+        return _act("scroll", scroll_amount=-.8 if "up" in text else .8, act_now="utterance_complete")
+
+    async def fake_execute(page, d):
+        executed.append(d.intent if d.intent == "search" else d.scroll_amount)
+        if d.intent == "search":
+            await asyncio.sleep(.3)
+        if len(executed) == 3:
+            done.set()
+        return "done"
+
+    _install(monkeypatch, fake_decide, fake_execute, [
+        (0, Transcript("search for pizza", True)),
+        (.05, Transcript("scroll down", True)),
+        (.05, Transcript("scroll up", True)),
+    ])
+    _run_until(done)
+    assert executed == ["search", .8, -.8]
+
+
+def test_audio_activity_prevents_payload_commit_when_transcript_stalls(monkeypatch):
+    monkeypatch.setattr(main.policy, "PAYLOAD_SILENCE_MS", 120)
+    done = asyncio.Event()
+    speech_ended = []
+    executed_at = []
+
+    async def fake_decide(text, *args, **kwargs):
+        return _act("search", text="clinics", act_now="clause_complete")
+
+    async def fake_execute(page, d):
+        executed_at.append(asyncio.get_running_loop().time())
+        done.set()
+        return "done"
+
+    _install(monkeypatch, fake_decide, fake_execute, [])
+    monkeypatch.setenv("VB_TRANSCRIBER", "apple")
+    monkeypatch.setattr(main, "apple_speech_available", lambda: True)
+
+    class FakeSpeech:
+        def __init__(self, on_level, **kwargs):
+            self.on_level = on_level
+
+        async def stream(self):
+            await self.on_level(.2)
+            yield Transcript("search for clinics", False, id=70)
+            for _ in range(12):
+                await asyncio.sleep(.04)
+                await self.on_level(.2)
+            speech_ended.append(asyncio.get_running_loop().time())
+            await self.on_level(0)
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(main, "AppleSpeechTranscriber", FakeSpeech)
+    _run_until(done)
+    assert executed_at[0] >= speech_ended[0] + .1
+
+
+def test_recognizer_revision_during_inference_cannot_execute_old_payload(monkeypatch):
+    executed = []
+    done = asyncio.Event()
+
+    async def fake_decide(text, *args, **kwargs):
+        await asyncio.sleep(.15)
+        return _act("search", text="pizza" if "pizza" in text else "pasta", act_now="clause_complete")
+
+    async def fake_execute(page, d):
+        executed.append(d.text)
+        done.set()
+        return "done"
+
+    _install(monkeypatch, fake_decide, fake_execute, [
+        (0, Transcript("search for pizza", False, id=10)),
+        (.12, Transcript("search for pasta", True, id=10)),
+    ])
+    _run_until(done)
+    assert executed == ["pasta"]

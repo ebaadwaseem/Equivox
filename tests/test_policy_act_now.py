@@ -22,12 +22,12 @@ def test_clause_complete_acts_without_final():
     assert policy.decide_outcome(_d(), is_final=False) == "COMMIT"
 
 
-def test_incomplete_waits_until_silence_or_final():
+def test_semantically_incomplete_command_still_waits_after_silence_or_final():
     d = _d(act_now="incomplete", complete=False)
     result = policy.evaluate(d, is_final=False)
     assert result.outcome == "WAIT"
-    assert result.retry_in_ms > 0
-    assert policy.decide_outcome(d, is_final=False, silent_ms=900) == "COMMIT"
+    assert policy.decide_outcome(d, is_final=False, silent_ms=900) == "WAIT"
+    assert policy.decide_outcome(d, is_final=True) == "WAIT"
 
 
 def test_not_a_command_is_ignored():
@@ -65,9 +65,9 @@ def test_stale_response_never_acts_before_the_text_settles():
     assert policy.decide_outcome(d, is_final=False, stale=True) == "WAIT"
 
 
-def test_stale_response_may_act_once_the_utterance_is_final():
+def test_stale_response_cannot_act_even_when_final():
     d = _d("scroll", target_id=None)
-    assert policy.decide_outcome(d, is_final=True, stale=True) == "COMMIT"
+    assert policy.decide_outcome(d, is_final=True, stale=True) == "WAIT"
 
 
 def test_stale_incomplete_response_never_acts():

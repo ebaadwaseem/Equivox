@@ -44,15 +44,16 @@ async def aclose() -> None:
         _client = None
 
 
-async def ask(model: str, state: str, questions: dict[str, Any]) -> Optional[dict[str, Any]]:
+async def ask(model: str, state: Any, questions: dict[str, Any]) -> Optional[dict[str, Any]]:
     """POST state+questions to Jev. Returns the `answers` dict, or None on any failure."""
     key = os.getenv("OPENROUTER_API_KEY")
     if not key:
         return None
+    url = os.getenv("VB_JEV_URL", JEV_URL)
     try:
         client = _get_client()
         r = await client.post(
-            JEV_URL,
+            url,
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
             json={"model": model, "state": state, "questions": questions},
         )
@@ -62,7 +63,7 @@ async def ask(model: str, state: str, questions: dict[str, Any]) -> Optional[dic
         logger.warning("jev: request timed out after %.1fs", TIMEOUT_S)
         return None
     except httpx.HTTPStatusError as e:
-        logger.warning("jev: HTTP %s from %s", e.response.status_code, JEV_URL)
+        logger.warning("jev: HTTP %s from %s", e.response.status_code, url)
         return None
     except Exception as e:
         logger.warning("jev: request failed: %s: %s", type(e).__name__, e)
