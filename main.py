@@ -56,6 +56,15 @@ TOGGLE_LISTENING_PHRASES = {"toggle listening"}
 SHOW_STATS_PHRASES = {"show stats", "show latency", "show latency stats"}
 LATENCY_SAMPLE_WINDOW = 200  # running median over the last N actions, not the whole session
 
+FILLER_WORDS = {"um", "umm", "uhm", "uh", "uhh", "er", "erm", "ah", "mm", "hmm"}
+
+
+def _strip_filler(text: str) -> str:
+    """"um"/"uh"-only noise, stripped just to test for emptiness -- the original
+    text (filler intact) is what actually continues through the pipeline when
+    there's real content alongside it."""
+    return " ".join(w for w in text.split() if w.strip(".,!?").lower() not in FILLER_WORDS)
+
 
 def _site_of(url: str) -> str:
     try:
@@ -431,6 +440,8 @@ async def main() -> None:
 
         async def handle(t: Transcript) -> None:
             nonlocal pending, listening_paused, silence_task
+            if not _strip_filler(t.text).strip():
+                return  # empty/whitespace/filler-only -- no Jev call, no log, no state change
             t_start = time.perf_counter()
             if silence_task and not silence_task.done():
                 silence_task.cancel()

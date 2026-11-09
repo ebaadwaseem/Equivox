@@ -601,3 +601,27 @@ def test_clicking_native_dropdown_publishes_selectable_voice_options(monkeypatch
     _run_until(done)
     assert any([row['label'] for row in rows] == ['Monday', 'Tuesday'] for rows in shown)
     assert shown[-1] == []
+
+
+def test_filler_only_transcript_never_reaches_decide(monkeypatch):
+    done = asyncio.Event()
+    decided: list[str] = []
+
+    async def fake_decide(text, is_final, elements_text, cands, **kwargs):
+        decided.append(text)
+        return _act("scroll", scroll_amount=0.8, act_now="utterance_complete")
+
+    async def fake_execute(page, d):
+        done.set()
+        return "Scrolling down"
+
+    _install(monkeypatch, fake_decide, fake_execute, [
+        (0, Transcript("um", True)),
+        (0, Transcript("   ", True)),
+        (0, Transcript("uh um", True)),
+        (.1, Transcript("scroll down", True)),
+    ])
+    _run_until(done)
+    # the filler-only/whitespace-only transcripts never reached decide() at all --
+    # only the real command did
+    assert decided == ["scroll down"]
