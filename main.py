@@ -32,7 +32,6 @@ from shared.protocol import Decision, Element, Transcript
 from ui import vox
 
 load_dotenv()
-START_URL = os.getenv("VB_START_URL", "https://news.ycombinator.com")
 
 logging.basicConfig(level=os.getenv("VB_LOG_LEVEL", "INFO"), format="%(levelname)s %(name)s: %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -923,7 +922,7 @@ async def main() -> None:
             active_page = ctx.pages[0] if ctx.pages else await ctx.new_page()
         else:
             active_page = await ctx.new_page()
-            await active_page.goto(START_URL)
+            await active_page.goto(os.getenv("VB_START_URL", "https://news.ycombinator.com"))
         for page in getattr(ctx, "pages", [active_page]):
             watch_page(page)
 
