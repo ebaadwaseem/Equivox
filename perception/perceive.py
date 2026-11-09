@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit
 
+import jellyfish
+from rapidfuzz import fuzz
 from playwright.async_api import Page
 
 from shared.protocol import Element, PageState
@@ -53,6 +55,28 @@ async def get_page_state(page: Page, with_screenshot: bool = False) -> PageState
     elapsed_ms = (time.perf_counter() - t0) * 1000
     logger.debug("get_page_state: %d elements in %.1f ms (%s)", len(elements), elapsed_ms, page.url)
     return state
+
+
+_VOCAB_WORD_RE = re.compile(r"[A-Za-z][A-Za-z'-]{2,}")
+
+
+def distinctive_page_words(state: PageState, limit: int = 100) -> list[str]:
+    """Up to `limit` distinctive words from this page's title and element names, sent
+    to the Swift listener as speech-recognition vocabulary hints -- a misheard proper
+    noun ("golisopod") is much less likely when that exact word is already on screen.
+    """
+    seen: set[str] = set()
+    words: list[str] = []
+    for text in (state.title, *(e.name for e in state.elements)):
+        for w in _VOCAB_WORD_RE.findall(text or ""):
+            key = w.lower()
+            if key in seen or key in _STOPWORDS:
+                continue
+            seen.add(key)
+            words.append(w)
+            if len(words) >= limit:
+                return words
+    return words
 
 
 # ---- shortlist -----------------------------------------------------------
@@ -190,13 +214,66 @@ def _find_next_field(elements: list[Element], transcript: str) -> Optional[Eleme
     return fields[0][1]  # wrap around
 
 
-def find_deterministic_target(elements: list[Element], transcript: str) -> Optional[Element]:
-    """Ordinal ("second link") or "next field" matches: these are positional/structural,
-    not semantic, so backend/model.py should trust this over the model's own target
-    guess -- a flat choice list gives an LLM no way to know an element is "the second
-    link" versus any other link.
+PHONETIC_ROLES = {"button", "link", "option", "tab", "menuitem"}
+PHONETIC_SCORE_THRESHOLD = 75  # rapidfuzz ratio between metaphone keys, 0-100
+PHONETIC_GAP_THRESHOLD = 15    # winner must clear the runner-up by this much
+
+
+def _content_words(transcript: str) -> list[str]:
+    """Command verbs/filler stripped, original word order kept (unlike
+    _transcript_words's unordered set) -- metaphone is position-sensitive, and a
+    leading "click"/"type" contributes phonemes of its own that just pollute the key."""
+    return [w for w in _WORD_RE.findall(transcript.lower()) if w not in _STOPWORDS]
+
+
+def _phonetic_key(text: str) -> str:
+    return jellyfish.metaphone(re.sub(r"[^a-zA-Z]", "", text))
+
+
+def _find_phonetic_target(elements: list[Element], transcript: str) -> Optional[Element]:
+    """A misheard word often shares no SUBSTRING with what it actually sounds like
+    ("goalie so pod" vs "Golisopod") -- _lexical_score alone scores every candidate 0
+    in that case. Falls back to a metaphone + rapidfuzz ratio match, but only when
+    lexical overlap found nothing at all, and only returns a target when there's one
+    CLEAR winner (score above threshold AND a real gap over the runner-up) -- anything
+    less certain is left to the normal ambiguous/DISAMBIGUATE path rather than
+    guessing blind.
     """
-    return _find_ordinal_target(elements, transcript) or _find_next_field(elements, transcript)
+    words = _transcript_words(transcript)
+    if not words:
+        return None
+    candidates = [e for e in elements if e.name.strip() and e.role in PHONETIC_ROLES]
+    if not candidates:
+        return None
+    # >=2 means at least one real exact-token hit (overlap*2) already exists; a lone
+    # partial-substring coincidence (worth 1, e.g. "pod" ⊂ "golisopod") is exactly the
+    # "only weak matches" case this fallback exists for, not a real lexical match.
+    if max(_lexical_score(e, words) for e in candidates) >= 2:
+        return None
+    query = _phonetic_key(" ".join(_content_words(transcript)))
+    if not query:
+        return None
+    scored = [(e, fuzz.ratio(query, _phonetic_key(e.name))) for e in candidates]
+    scored = [(e, s) for e, s in scored if s > 0]
+    if not scored:
+        return None
+    scored.sort(key=lambda pair: pair[1], reverse=True)
+    best_e, best_score = scored[0]
+    runner_up = scored[1][1] if len(scored) > 1 else 0
+    if best_score >= PHONETIC_SCORE_THRESHOLD and best_score - runner_up >= PHONETIC_GAP_THRESHOLD:
+        return best_e
+    return None
+
+
+def find_deterministic_target(elements: list[Element], transcript: str) -> Optional[Element]:
+    """Ordinal ("second link"), "next field", or a clear phonetic match: these are
+    positional/structural/acoustic, not semantic, so backend/model.py should trust
+    this over the model's own target guess -- a flat choice list gives an LLM no way
+    to know an element is "the second link" versus any other link, and Jev never
+    hears the audio, so it can't itself reason about what a misheard word sounded like.
+    """
+    return (_find_ordinal_target(elements, transcript) or _find_next_field(elements, transcript)
+            or _find_phonetic_target(elements, transcript))
 
 
 # ---- the current page's own search box (vs. an external web search) --------------------
@@ -244,7 +321,8 @@ def _lexical_score(e: Element, words: set[str]) -> int:
 
 
 def shortlist(state: PageState, transcript: str, limit: int = 40) -> list[Element]:
-    """Ordinal / "next field" matches are pinned first, then role-word filtered + lexical overlap, then viewport."""
+    """Ordinal / "next field" / clear phonetic matches are pinned first, then
+    role-word filtered + lexical overlap, then viewport."""
     elements = state.elements
     words = _transcript_words(transcript)
     role_filter = _find_role_filter(transcript)
@@ -254,6 +332,8 @@ def shortlist(state: PageState, transcript: str, limit: int = 40) -> list[Elemen
         pinned.append(ordinal_match)
     if (next_field := _find_next_field(elements, transcript)) and next_field not in pinned:
         pinned.append(next_field)
+    if (phonetic_match := _find_phonetic_target(elements, transcript)) and phonetic_match not in pinned:
+        pinned.append(phonetic_match)
 
     def score(e: Element) -> tuple:
         role_mismatch = role_filter is not None and e.role not in role_filter

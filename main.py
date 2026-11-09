@@ -29,7 +29,7 @@ from backend.model import decide
 from backend.scheduler import Scheduler
 from executor import act, undo
 from executor.act import execute, highlight
-from perception.perceive import ORDINALS, get_page_state, shortlist, to_prompt_text
+from perception.perceive import ORDINALS, distinctive_page_words, get_page_state, shortlist, to_prompt_text
 from shared.protocol import Decision, Element, Transcript
 from ui import vox
 
@@ -783,6 +783,13 @@ async def main() -> None:
                 state = await get_page_state(request_page, with_screenshot=True)
             else:
                 state = form_state or await get_page_state(request_page)
+            # Bias the Swift recognizer toward whatever's actually on screen -- a
+            # misheard proper noun is much less likely once it's in contextualStrings.
+            # Moonshine has no observed per-request keyterm-update API to hook here, so
+            # this is Apple-only; duck-typed (not isinstance) since it's the one
+            # genuinely optional capability the two adapters don't share.
+            if hasattr(apple_transcriber, "send_vocab"):
+                await apple_transcriber.send_vocab(distinctive_page_words(state))
             cands = shortlist(state, t.text)
             viewport = request_page.viewport_size
             vp = (viewport["width"], viewport["height"]) if viewport else None

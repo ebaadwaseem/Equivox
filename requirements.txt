@@ -2,5 +2,7 @@ playwright
 httpx
 python-dotenv
 Pillow
+jellyfish
+rapidfuzz
 # person 1, pick one:
 # mlx-whisper sounddevice numpy

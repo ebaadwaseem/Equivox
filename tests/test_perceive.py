@@ -6,7 +6,10 @@ from pathlib import Path
 import pytest
 from playwright.async_api import async_playwright
 
-from perception.perceive import build_choice_criteria, find_deterministic_target, get_page_state, shortlist, to_prompt_text
+from perception.perceive import (
+    build_choice_criteria, distinctive_page_words, find_deterministic_target,
+    get_page_state, shortlist, to_prompt_text,
+)
 from shared.protocol import Element, PageState
 
 FORM_FIXTURE = (Path(__file__).parent / "fixtures" / "pages" / "form.html").resolve().as_uri()
@@ -114,6 +117,86 @@ def test_shortlist_caps_at_limit():
     state = make_state(*elements)
     result = shortlist(state, "click something", limit=24)
     assert len(result) == 24
+
+
+# ---- phonetic fallback: no lexical overlap, but it clearly SOUNDS like one target ------
+
+def test_shortlist_phonetic_match_click_goalie_so_pod():
+    golisopod = Element(id="e1", role="link", name="Golisopod")
+    unrelated = Element(id="e2", role="link", name="Pikachu")
+    state = make_state(unrelated, golisopod)
+    result = shortlist(state, "click goalie so pod")
+    assert result[0].id == "e1"
+
+
+def test_find_deterministic_target_phonetic_match():
+    golisopod = Element(id="e1", role="link", name="Golisopod")
+    unrelated = Element(id="e2", role="link", name="Pikachu")
+    match = find_deterministic_target([unrelated, golisopod], "click goalie so pod")
+    assert match is not None and match.id == "e1"
+
+
+def test_phonetic_match_does_not_fire_when_lexical_overlap_exists():
+    # "click sign up" has real substring overlap with "Sign up" -- the phonetic
+    # fallback must never override an already-working lexical match
+    signup = Element(id="e1", role="button", name="Sign up")
+    match = find_deterministic_target([signup], "click sign up")
+    assert match is None  # lexical overlap exists -> not the phonetic matcher's job
+
+
+def test_phonetic_match_requires_a_clear_winner():
+    # two candidates that sound similarly close to the query -- neither should win
+    a = Element(id="e1", role="link", name="Golbat")
+    b = Element(id="e2", role="link", name="Goldeen")
+    match = find_deterministic_target([a, b], "click goalie so pod")
+    assert match is None
+
+
+def test_phonetic_match_ignores_unrelated_single_candidate():
+    # one candidate, but it doesn't actually sound anything like the query
+    decoy = Element(id="e1", role="link", name="Privacy Policy")
+    match = find_deterministic_target([decoy], "click goalie so pod")
+    assert match is None
+
+
+# ---- distinctive_page_words: vocabulary hints sent to the Swift listener --------------
+
+def test_distinctive_page_words_includes_title_and_element_names():
+    state = PageState(url="https://example.com", title="Golisopod - Bulbapedia",
+                      elements=[Element(id="e1", role="link", name="Pikachu")])
+    words = distinctive_page_words(state)
+    assert "Golisopod" in words
+    assert "Bulbapedia" in words
+    assert "Pikachu" in words
+
+
+def test_distinctive_page_words_dedupes_case_insensitively():
+    state = PageState(url="https://example.com", title="Golisopod",
+                      elements=[Element(id="e1", role="link", name="golisopod")])
+    words = distinctive_page_words(state)
+    assert words.count("Golisopod") + words.count("golisopod") == 1
+
+
+def test_distinctive_page_words_excludes_stopwords_and_short_words():
+    state = PageState(url="https://example.com", title="The Best 10 Clinics in Edmonton",
+                      elements=[])
+    words = distinctive_page_words(state)
+    assert "The" not in words and "in" not in words
+    assert "Clinics" in words and "Edmonton" in words
+
+
+def test_distinctive_page_words_respects_limit():
+    import itertools
+    import string
+    # each element's name is its own unique word (letters only -- the extraction
+    # regex strips digits, so a numeric suffix like "word0"/"word1" would collapse
+    # into the same word and defeat the point of this test)
+    suffixes = itertools.islice(itertools.product(string.ascii_lowercase, repeat=3), 150)
+    elements = [Element(id=f"e{i}", role="link", name="word" + "".join(suffix))
+                for i, suffix in enumerate(suffixes)]
+    state = PageState(url="https://example.com", title="", elements=elements)
+    words = distinctive_page_words(state, limit=100)
+    assert len(words) == 100
 
 
 # ---- to_prompt_text / build_choice_criteria ------------------------------

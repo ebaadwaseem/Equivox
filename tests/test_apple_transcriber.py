@@ -3,6 +3,7 @@ fake of the Swift listener) -- no microphone, no Speech framework, no real subpr
 binary required.
 """
 import asyncio
+import json
 import sys
 from pathlib import Path
 
@@ -139,3 +140,42 @@ def test_pause_and_resume_write_to_stdin(tmp_path):
             await agen.aclose()
 
     asyncio.run(run())
+
+
+class _FakeStdin:
+    def __init__(self):
+        self.written: list[bytes] = []
+
+    def write(self, data: bytes) -> None:
+        self.written.append(data)
+
+    async def drain(self) -> None:
+        pass
+
+
+class _FakeProcess:
+    def __init__(self):
+        self.stdin = _FakeStdin()
+
+
+def test_send_vocab_writes_expected_json_line():
+    transcriber = AppleSpeechTranscriber(command=["unused"])
+    transcriber._process = _FakeProcess()
+
+    asyncio.run(transcriber.send_vocab(["Golisopod", "Edmonton"]))
+
+    assert len(transcriber._process.stdin.written) == 1
+    line = transcriber._process.stdin.written[0].decode()
+    assert line.startswith("vocab ")
+    assert json.loads(line[len("vocab "):].strip()) == {"words": ["Golisopod", "Edmonton"]}
+
+
+def test_send_vocab_caps_at_100_words():
+    transcriber = AppleSpeechTranscriber(command=["unused"])
+    transcriber._process = _FakeProcess()
+
+    asyncio.run(transcriber.send_vocab([f"word{i}" for i in range(150)]))
+
+    line = transcriber._process.stdin.written[0].decode()
+    payload = json.loads(line[len("vocab "):].strip())
+    assert len(payload["words"]) == 100

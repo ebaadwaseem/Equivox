@@ -134,6 +134,12 @@ class AppleSpeechTranscriber:
     async def resume(self) -> None:
         await self._send_control("resume")
 
+    async def send_vocab(self, words: list[str]) -> None:
+        """Up to 100 distinctive words from the CURRENT page, merged into the Swift
+        listener's contextualStrings for its next new request -- a misheard word is
+        much less likely when it's already visible on screen."""
+        await self._send_control("vocab " + json.dumps({"words": words[:100]}))
+
     async def _send_control(self, cmd: str) -> None:
         if self._process is None or self._process.stdin is None:
             return

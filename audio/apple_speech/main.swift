@@ -12,7 +12,9 @@
 //   {"type":"final","id":<n>,"text":"...","confidence":0.0-1.0}
 //   {"type":"level","value":0.0-1.0}
 //   {"type":"status","value":"listening"|"paused"|"error","detail":"..."}
-// stdin: lines "pause" / "resume" (pause = stop sending audio, no output).
+// stdin: lines "pause" / "resume" (pause = stop sending audio, no output), or
+// `vocab {"words":[...]}` -- up to 100 words merged into contextualStrings for every
+// NEW request from then on (not the one already in flight).
 import AVFoundation
 import Foundation
 import Speech
@@ -120,6 +122,7 @@ final class Listener {
     var hasFinalizedCurrent = false
     var paused = false
     var lastLevelEmit = Date.distantPast
+    var pageVocabulary: [String] = []  // updated via stdin "vocab {...}"; merged in at each beginNewRequest()
 
     init(recognizer: SFSpeechRecognizer) {
         self.recognizer = recognizer
@@ -191,7 +194,10 @@ final class Listener {
         req.requiresOnDeviceRecognition = !allowServer
         let extra = (ProcessInfo.processInfo.environment["VB_SPEECH_TERMS"] ?? "")
             .split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-        req.contextualStrings = Array((extra + Listener.contextualStrings).prefix(100))
+        // pageVocabulary (the CURRENT page's own distinctive words, pushed over stdin)
+        // goes first -- it's the most relevant bias and the most likely to get pushed
+        // out by Apple's ~100-phrase cap if the static lists came first.
+        req.contextualStrings = Array((pageVocabulary + extra + Listener.contextualStrings).prefix(100))
         currentRequest = req
 
         currentTask = recognizer.recognitionTask(with: req) { [weak self] result, error in
@@ -278,16 +284,28 @@ final class Listener {
             let data = handle.availableData
             guard !data.isEmpty, let str = String(data: data, encoding: .utf8) else { return }
             for rawLine in str.split(separator: "\n") {
-                let cmd = rawLine.trimmingCharacters(in: .whitespaces).lowercased()
+                let trimmed = rawLine.trimmingCharacters(in: .whitespaces)
+                let cmd = trimmed.lowercased()
                 if cmd == "pause" {
                     self.paused = true
                     emitStatus("paused")
                 } else if cmd == "resume" {
                     self.paused = false
                     emitStatus("listening")
+                } else if cmd.hasPrefix("vocab ") {
+                    // payload comes from the ORIGINAL (not lowercased) line -- word
+                    // casing is preserved for the recognizer's own biasing.
+                    self.updateVocabulary(from: String(trimmed.dropFirst("vocab ".count)))
                 }
             }
         }
+    }
+
+    private func updateVocabulary(from jsonPayload: String) {
+        guard let data = jsonPayload.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let words = obj["words"] as? [String] else { return }
+        pageVocabulary = Array(words.prefix(100))
     }
 
     static func confidence(of result: SFSpeechRecognitionResult) -> Double {
