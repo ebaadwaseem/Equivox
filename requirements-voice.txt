@@ -1,0 +1,2 @@
+# Optional local streaming speech. Keep separate from browser-only installs.
+moonshine-voice==0.1.6

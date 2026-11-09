@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Vox mascot preview</title>
+<style>
+  :root { --level: 0; } /* 0..1 mic volume, set from JS while listening */
+
+  body {
+    margin: 0; min-height: 100vh; display: grid; place-items: center;
+    font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+    background:
+      radial-gradient(circle at 20% 30%, #ff9a5a 0 12%, transparent 13%),
+      radial-gradient(circle at 75% 65%, #3a7bd5 0 18%, transparent 19%),
+      repeating-linear-gradient(45deg, #222 0 18px, #f4f4f4 18px 36px);
+    color: #0b2540;
+  }
+  .stage { display: flex; flex-direction: column; align-items: center; gap: 28px; }
+
+  /* ---------- the mascot ---------- */
+  .vox { width: 180px; height: 180px; position: relative; margin: 8px; }
+  .vox svg { width: 100%; height: 100%; overflow: hidden; } /* nothing can spill out and get clipped by the screen edge */
+  .vox .body-g { transform-origin: 100px 110px; animation: bob 3.2s ease-in-out infinite; }
+  .vox .eyes  { transform-origin: 100px 100px; transition: transform .25s ease; }
+  .vox .eye   { transform-box: fill-box; transform-origin: center; transition: transform .2s ease; }
+  .vox .lid   { transform-box: fill-box; transform-origin: center; transform: scaleY(0); }
+  .vox .happy, .vox .brow, .vox .q, .vox .sweat, .vox .worry { opacity: 0; transition: opacity .2s; }
+  .vox .ring  { opacity: 0; }
+
+  /* idle: bob + blink */
+  .vox.idle .eye { animation: blink 4s infinite; }
+
+  /* listening: wide eyes, pulse with mic level */
+  .vox.listening .eye { transform: scale(1.15); }
+  .vox.listening .body-g { animation: none; transform: scale(calc(1 + var(--level) * .08)); transition: transform .08s; }
+  .vox.listening .ring { opacity: 1; animation: ring 1.4s ease-out infinite; }
+
+  /* thinking: eyes look side to side */
+  .vox.thinking .eyes { animation: look 1.2s ease-in-out infinite; }
+
+  /* acting: happy ^ ^ and a hop */
+  .vox.acting .eye { opacity: 0; }
+  .vox.acting .happy { opacity: 1; }
+  .vox.acting .body-g { animation: hop .6s ease-out infinite; }
+
+  /* unsure: tilt, brow, question bubble */
+  .vox.unsure .body-g { animation: none; transform: rotate(-10deg); transition: transform .3s; }
+  .vox.unsure .brow, .vox.unsure .q { opacity: 1; }
+  .vox.unsure .eye.r { transform: scaleY(.8); }
+
+  /* error: one flinch, worried brows, dripping sweat (friendly, not alarming) */
+  .vox.error .body-g { animation: flinch .5s ease-in-out 1; }
+  .vox.error .eye { transform: scaleY(.8) translateY(2px); }
+  .vox.error .worry { opacity: 1; }
+  .vox .sweat { transform-box: fill-box; transform-origin: center top; }
+  .vox.error .sweat   { animation: drip 1.4s ease-in .2s infinite; }
+  .vox.error .sweat.s2 { animation: drip 1.4s ease-in .9s infinite; }
+
+  @keyframes bob    { 0%,100% { transform: translateY(0) } 50% { transform: translateY(-6px) } }
+  @keyframes blink  { 0%,92%,100% { transform: scaleY(1) } 95% { transform: scaleY(.1) } }
+  @keyframes look   { 0%,100% { transform: translateX(-7px) } 50% { transform: translateX(7px) } }
+  @keyframes hop    { 0%,100% { transform: translateY(0) scale(1,1) } 30% { transform: translateY(-14px) scale(.96,1.04) } 60% { transform: translateY(0) scale(1.05,.95) } }
+  @keyframes flinch { 0%,100% { transform: translateX(0) rotate(0) } 20% { transform: translateX(-6px) rotate(-5deg) } 45% { transform: translateX(5px) rotate(4deg) } 70% { transform: translateX(-2px) rotate(-1deg) } }
+  @keyframes drip   { 0% { opacity: 0; transform: translateY(-4px) scale(.6) } 15% { opacity: 1; transform: translateY(0) scale(1) } 75% { opacity: 1; transform: translateY(26px) scale(1,1.15) } 100% { opacity: 0; transform: translateY(34px) scale(.8,1.2) } }
+  @keyframes wobble { 0%,100% { transform: rotate(0) } 25% { transform: rotate(-6deg) } 75% { transform: rotate(6deg) } }
+  @keyframes ring   { 0%,100% { opacity: .35; stroke-width: 3 } 50% { opacity: 1; stroke-width: 6 } }
+
+  @media (prefers-reduced-motion: reduce) {
+    .vox * { animation: none !important; }
+  }
+
+  /* ---------- frosted transcript panel ---------- */
+  .panel {
+    width: min(460px, 90vw); padding: 14px 18px; border-radius: 18px; position: relative; overflow: hidden;
+    /* Frutiger Aero frosted glass: light aqua tint, a little see-through */
+    background: linear-gradient(180deg, rgba(255,255,255,.80) 0%, rgba(232,248,255,.72) 55%, rgba(214,244,236,.70) 100%);
+    backdrop-filter: blur(16px) saturate(160%); -webkit-backdrop-filter: blur(16px) saturate(160%);
+    border: 1px solid rgba(255,255,255,.95);
+    box-shadow: 0 10px 28px rgba(10,60,110,.22), 0 0 0 1px rgba(120,190,230,.35), inset 0 1px 0 #fff;
+  }
+  .panel::after {            /* glossy top half, classic Aero */
+    content: ""; position: absolute; left: 0; right: 0; top: 0; height: 48%; pointer-events: none;
+    background: linear-gradient(180deg, rgba(255,255,255,.75), rgba(255,255,255,.12));
+    border-radius: 18px 18px 50% 50% / 18px 18px 14px 14px;
+  }
+  .panel > * { position: relative; z-index: 1; }
+  .panel .label { font-size: 13px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: #0d4f7a; }
+  .stage[data-state="error"] .panel .label { color: #9a4a00; }
+  .panel .hide { position: absolute; top: 8px; right: 10px; width: 26px; height: 26px; border-radius: 50%;
+    border: 1px solid rgba(255,255,255,.7); background: rgba(255,255,255,.4); color: #0b2540;
+    font-size: 16px; line-height: 1; cursor: pointer; }
+  /* minimized: panel gone, small droplet only; click it to restore */
+  .stage.min .panel { display: none; }
+  .stage.min .vox { width: 64px; height: 64px; cursor: pointer; }
+  .stage.min .vox .q, .stage.min .vox .ring { display: none; }
+  .panel .text  { font-size: 20px; font-weight: 600; text-shadow: 0 1px 0 rgba(255,255,255,.8); margin-top: 4px; color: #06182b; min-height: 1.4em; }
+
+  .stage[data-state="error"] .panel { border-color: rgba(245,158,11,.85); box-shadow: 0 10px 30px rgba(0,30,60,.25), 0 0 0 3px rgba(245,158,11,.25), inset 0 1px 0 rgba(255,255,255,.9); }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
+  .controls button {
+    font: inherit; font-size: 14px; padding: 8px 14px; border-radius: 999px; cursor: pointer;
+    border: 1px solid rgba(255,255,255,.9); color: #0b2540;
+    background: linear-gradient(180deg, #ffffff 0%, #d9f1ff 100%);
+    box-shadow: 0 2px 6px rgba(20,80,140,.15);
+  }
+  .controls button[aria-pressed="true"] { background: linear-gradient(180deg, #7fd3ff 0%, #2f9be0 100%); color: #fff; }
+</style>
+</head>
+<body>
+<div class="stage">
+
+  <div class="vox idle" id="vox" role="img" aria-label="Vox assistant: idle">
+    <svg viewBox="0 0 200 200" aria-hidden="true">
+      <defs>
+        <radialGradient id="vx-body" cx="38%" cy="32%" r="75%">
+          <stop offset="0%"  stop-color="#ffffff" stop-opacity=".55"/>
+          <stop offset="40%" stop-color="#8fe3ff" stop-opacity=".38"/>
+          <stop offset="80%" stop-color="#2aa8e8" stop-opacity=".55"/>
+          <stop offset="100%" stop-color="#0f78c0" stop-opacity=".85"/>
+        </radialGradient>
+        <linearGradient id="vx-ring" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0%" stop-color="#b6f36a"/>
+          <stop offset="100%" stop-color="#3ccf8e"/>
+        </linearGradient>
+        <radialGradient id="vx-glow" cx="50%" cy="85%" r="45%">
+          <stop offset="0%" stop-color="#c8ffe9" stop-opacity=".8"/>
+          <stop offset="100%" stop-color="#c8ffe9" stop-opacity="0"/>
+        </radialGradient>
+        <linearGradient id="vx-shine" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stop-color="#fff" stop-opacity=".95"/>
+          <stop offset="100%" stop-color="#fff" stop-opacity="0"/>
+        </linearGradient>
+        <radialGradient id="vx-shadow" cx="50%" cy="50%" r="50%">
+          <stop offset="0%" stop-color="#0b4a7a" stop-opacity=".28"/>
+          <stop offset="100%" stop-color="#0b4a7a" stop-opacity="0"/>
+        </radialGradient>
+      </defs>
+
+      <ellipse cx="100" cy="184" rx="52" ry="9" fill="url(#vx-shadow)"/>
+      <circle class="ring" cx="100" cy="108" r="84" fill="none" stroke="url(#vx-ring)" stroke-width="5"/>
+
+      <g class="body-g">
+        <!-- droplet body -->
+        <path d="M100 18 C 128 48, 172 74, 172 112 A 72 68 0 0 1 28 112 C 28 74, 72 48, 100 18 Z"
+              fill="url(#vx-body)" stroke="#ffffff" stroke-opacity=".85" stroke-width="2.5"/>
+        <!-- inner refraction glow + rim shading -->
+        <ellipse cx="100" cy="150" rx="46" ry="22" fill="url(#vx-glow)"/>
+        <!-- gloss -->
+        <ellipse cx="74" cy="72" rx="26" ry="15" fill="url(#vx-shine)" transform="rotate(-28 74 72)"/>
+        <circle cx="140" cy="140" r="5" fill="#fff" opacity=".55"/>
+        <circle cx="128" cy="152" r="2.5" fill="#fff" opacity=".45"/>
+
+        <!-- eyes -->
+        <g class="eyes">
+          <g class="eye l"><ellipse cx="80" cy="108" rx="9" ry="13" fill="#0b2540"/><circle cx="83" cy="102" r="3.2" fill="#fff"/></g>
+          <g class="eye r"><ellipse cx="120" cy="108" rx="9" ry="13" fill="#0b2540"/><circle cx="123" cy="102" r="3.2" fill="#fff"/></g>
+          <!-- happy ^ ^ -->
+          <g class="happy" fill="none" stroke="#0b2540" stroke-width="5" stroke-linecap="round">
+            <path d="M70 112 Q80 98 90 112"/><path d="M110 112 Q120 98 130 112"/>
+          </g>
+          <!-- worried brows (error) -->
+          <g class="worry" fill="none" stroke="#0b2540" stroke-width="4" stroke-linecap="round">
+            <path d="M68 92 L88 86"/><path d="M132 92 L112 86"/>
+          </g>
+          <!-- raised brow (unsure) -->
+          <path class="brow" d="M110 86 Q121 78 132 84" fill="none" stroke="#0b2540" stroke-width="4" stroke-linecap="round"/>
+        </g>
+        <!-- cheeks -->
+        <ellipse cx="66" cy="128" rx="8" ry="4.5" fill="#ff9fc0" opacity=".55"/>
+        <ellipse cx="134" cy="128" rx="8" ry="4.5" fill="#ff9fc0" opacity=".55"/>
+        <!-- sweat drop (error) -->
+        <path class="sweat s2" d="M150 86 c 3.5 6, 5.5 9, 5.5 12 a 5.5 5.5 0 0 1 -11 0 c 0 -3, 2 -6, 5.5 -12 z" fill="#bfefff" stroke="#3aa6dc" stroke-width="1.2"/>
+        <path class="sweat" d="M156 70 c 5 8, 8 12, 8 16 a 8 8 0 0 1 -16 0 c 0 -4, 3 -8, 8 -16 z" fill="#bfefff" stroke="#3aa6dc" stroke-width="1.5"/>
+      </g>
+
+      <!-- question bubble (unsure) -->
+      <g class="q">
+        <circle cx="168" cy="38" r="18" fill="#fff" stroke="#7fcdf5" stroke-width="2"/>
+        <text x="168" y="46" text-anchor="middle" font-size="24" font-weight="700" fill="#1d7fc0">?</text>
+      </g>
+    </svg>
+  </div>
+
+  <div class="panel" aria-live="polite">
+    <button class="hide" id="hide" aria-label="Hide Vox" title="Hide (or say 'hide Vox')">–</button>
+    <div class="label" id="label">Idle</div>
+    <div class="text" id="text">Say something like "search for physio clinics"</div>
+  </div>
+
+  <div class="controls" id="controls"></div>
+</div>
+
+<script>
+  // In the real UI, call setVoxState(state, text) from the websocket/policy events.
+  const STATES = {
+    idle:      ["Idle",         'Say something like "search for physio clinics"'],
+    listening: ["Listening…",   "search for physiotherapy clinics in"],
+    thinking:  ["Thinking…",    "search for physiotherapy clinics in Edmonton"],
+    acting:    ["Done",         "Searching: physiotherapy clinics in Edmonton"],
+    unsure:    ["Did you mean…","1 · Book appointment   2 · Book a consult"],
+    error:     ["Oops",         "I couldn't find \"book appointment\" on this page. Try saying it differently?"],
+  };
+  const vox = document.getElementById("vox");
+  let current = "idle";
+  let micTimer = null;
+
+  function setVoxState(state, text) {
+    current = state;
+    vox.className = "vox " + state;
+    document.querySelector(".stage").dataset.state = state;
+    vox.setAttribute("aria-label", "Vox assistant: " + state);
+    document.getElementById("label").textContent = STATES[state][0];
+    document.getElementById("text").textContent = text ?? STATES[state][1];
+    document.querySelectorAll("#controls button").forEach(b =>
+      b.setAttribute("aria-pressed", b.dataset.s === state));
+    // demo only: fake mic level while listening
+    clearInterval(micTimer);
+    if (state === "listening") micTimer = setInterval(() =>
+      vox.style.setProperty("--level", Math.random().toFixed(2)), 120);
+  }
+  window.setVoxState = setVoxState;
+
+  const controls = document.getElementById("controls");
+  for (const s of Object.keys(STATES)) {
+    const b = document.createElement("button");
+    b.textContent = s; b.dataset.s = s;
+    b.onclick = () => setVoxState(s);
+    controls.appendChild(b);
+  }
+  const stage = document.querySelector(".stage");
+  function minimize() { stage.classList.add("min"); }
+  function restore()  { stage.classList.remove("min"); const t = document.getElementById("text").textContent;
+                        vox.className = "vox"; void vox.offsetWidth; setVoxState(current, t); } // restart animations
+  window.voxMinimize = minimize; window.voxRestore = restore;
+  document.getElementById("hide").onclick = minimize;
+  vox.onclick = () => { if (stage.classList.contains("min")) restore(); };
+  setVoxState("idle");
+</script>
+</body>
+</html>

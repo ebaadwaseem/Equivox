@@ -1,6 +1,10 @@
 .DS_Store
 .env
+.venv/
 __pycache__/
 *.pyc
 .playwright-mcp/
 spike-log.jsonl
+bin/
+
+.cache/

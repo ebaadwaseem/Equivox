@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Inner scrolling container</title>
+<style>
+  /* the window itself never scrolls -- mirrors Gmail/Docs/Discord-style app layouts
+     where an inner panel owns the scrollbar, not <body>/<html> */
+  html, body { margin: 0; height: 100%; overflow: hidden; font-family: sans-serif; }
+  .app { display: flex; flex-direction: column; height: 100vh; }
+  header, footer { flex: 0 0 10vh; background: #333; color: #fff; display: flex; align-items: center; justify-content: center; }
+  #inner-scroll { flex: 1 1 auto; overflow-y: auto; }
+  #inner-scroll .block { height: 100vh; display: flex; align-items: center; justify-content: center;
+    font-size: 28px; border-bottom: 1px solid #ccc; }
+  #inner-scroll .block:nth-child(odd) { background: #eef; }
+  #inner-scroll .block:nth-child(even) { background: #efe; }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>App header (never scrolls)</header>
+  <div id="inner-scroll">
+    <div class="block" id="b1">Block 1 (top)</div>
+    <div class="block" id="b2">Block 2</div>
+    <div class="block" id="b3">Block 3</div>
+    <div class="block" id="b4">Block 4</div>
+    <div class="block" id="b5">Block 5 (bottom)</div>
+  </div>
+  <footer>App footer (never scrolls)</footer>
+</div>
+</body>
+</html>
