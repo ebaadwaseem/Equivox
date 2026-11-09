@@ -101,7 +101,8 @@ async def main() -> None:
             browser = await p.chromium.connect_over_cdp(cdp)
             ctx = browser.contexts[0]
         else:
-            browser = await p.chromium.launch(headless=False)
+            # --start-maximized opens at the full available window size
+            browser = await p.chromium.launch(headless=False, args=["--start-maximized"])
             # browser.new_page() is a shortcut that creates a context which can't have
             # more tabs added to it later ("Please use browser.new_context()") -- tab
             # management needs a real context we can call .new_page() on repeatedly.
@@ -109,7 +110,10 @@ async def main() -> None:
             # blocks ALL inline styling -- both <style> tags and style="" attributes -- for
             # every script running in that page, including our injected overlay, which
             # would otherwise render huge and unstyled with every state shown at once.
-            ctx = await browser.new_context(bypass_csp=True)
+            # no_viewport: do NOT emulate a fixed 1280x720 viewport. The page follows the
+            # real window size, so resizing/maximizing/fullscreen (green button or
+            # Ctrl+Cmd+F) reflows normally instead of being locked to a fixed aspect ratio.
+            ctx = await browser.new_context(bypass_csp=True, no_viewport=True)
 
         active_page = None  # tab commands can change which Page subsequent commands act on
         checkpoints: list[undo.Checkpoint] = []  # for smart "go back"/"undo"
