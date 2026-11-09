@@ -29,6 +29,7 @@ from backend.model import decide
 from backend.scheduler import Scheduler
 from executor import act, undo
 from executor.act import execute, highlight
+from perception import adblock
 from perception.perceive import ORDINALS, distinctive_page_words, get_page_state, shortlist, to_prompt_text
 from shared.protocol import Decision, Element, Transcript
 from ui import vox
@@ -113,6 +114,11 @@ async def main() -> None:
             # every script running in that page, including our injected overlay, which
             # would otherwise render huge and unstyled with every state shown at once.
             ctx = await browser.new_context(bypass_csp=True)
+
+        # VB_BLOCK_ADS defaults on: abort known ad/tracker requests (script/image/xhr/
+        # fetch/subframe-document) before they ever load -- never the main document.
+        if os.getenv("VB_BLOCK_ADS", "1") != "0":
+            await ctx.route("**/*", adblock.route_handler)
 
         active_page = None  # tab commands can change which Page subsequent commands act on
         checkpoints: list[undo.Checkpoint] = []  # for smart "go back"/"undo"

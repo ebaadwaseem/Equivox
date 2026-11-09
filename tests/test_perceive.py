@@ -472,6 +472,106 @@ def test_corner_button_found_despite_overlay(form_state_with_overlay):
     assert any(e.name == "Corner Action" for e in state.elements)
 
 
+# ---- overlay.js must only ever mount in the TOP frame, never in ad/child iframes ------
+
+FIVE_IFRAMES_FIXTURE = (Path(__file__).parent / "fixtures" / "pages" / "five_iframes.html").resolve().as_uri()
+
+
+async def _count_vox_hosts(page) -> int:
+    total = 0
+    for frame in page.frames:
+        try:
+            total += await frame.evaluate("() => document.getElementById('vox-host') ? 1 : 0")
+        except Exception:
+            pass  # a detached/cross-origin frame just doesn't count
+    return total
+
+
+def test_overlay_mounts_exactly_once_on_a_page_with_five_iframes():
+    async def run():
+        async with async_playwright() as p:
+            browser = await p.chromium.launch()
+            page = await browser.new_page()
+            await page.add_init_script(OVERLAY_JS)
+            await page.goto(FIVE_IFRAMES_FIXTURE)
+            await page.wait_for_selector("#vox-host", timeout=3000, state="attached")
+            assert len(page.frames) == 6  # main + 5 iframes -- otherwise this test proves nothing
+            count = await _count_vox_hosts(page)
+            await browser.close()
+            return count
+
+    assert asyncio.run(run()) == 1
+
+
+# ---- perception's frame filter: skip ad/tiny iframes, keep legit ones, cap at 5 ------
+
+AD_IFRAME_URL = "https://doubleclick.net/test-ad-slot"
+LEGIT_IFRAME_URL = "https://legit-embed.example.com/test-frame"
+TINY_IFRAME_URL = "https://legit-embed.example.com/tiny-frame"
+
+
+async def _route_fixed_body(route, body: str) -> None:
+    await route.fulfill(body=body, content_type="text/html")
+
+
+async def _load_frame_filter_state() -> PageState:
+    async with async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page()
+        await page.route(AD_IFRAME_URL, lambda r: asyncio.ensure_future(_route_fixed_body(r, "<button>Ad CTA</button>")))
+        await page.route(LEGIT_IFRAME_URL, lambda r: asyncio.ensure_future(_route_fixed_body(r, "<button>Legit Button</button>")))
+        await page.route(TINY_IFRAME_URL, lambda r: asyncio.ensure_future(_route_fixed_body(r, "<button>Tiny Button</button>")))
+        await page.set_content(f'''
+            <h1>Host page</h1>
+            <iframe src="{AD_IFRAME_URL}" width="300" height="250"></iframe>
+            <iframe src="{LEGIT_IFRAME_URL}" width="400" height="300"></iframe>
+            <iframe src="{TINY_IFRAME_URL}" width="5" height="5"></iframe>
+        ''')
+        await page.wait_for_timeout(300)  # let the iframes finish loading
+        state = await get_page_state(page)
+        await browser.close()
+        return state
+
+
+def test_frame_filter_skips_ad_host_iframe():
+    state = asyncio.run(_load_frame_filter_state())
+    assert not any(e.name == "Ad CTA" for e in state.elements)
+
+
+def test_frame_filter_scans_legit_sized_iframe():
+    state = asyncio.run(_load_frame_filter_state())
+    assert any(e.name == "Legit Button" for e in state.elements)
+
+
+def test_frame_filter_skips_tiny_iframe():
+    state = asyncio.run(_load_frame_filter_state())
+    assert not any(e.name == "Tiny Button" for e in state.elements)
+
+
+async def _load_frame_cap_state() -> PageState:
+    iframes = "".join(
+        f'<iframe src="{LEGIT_IFRAME_URL}" width="300" height="200" id="f{i}"></iframe>'
+        for i in range(7)
+    )
+    async with async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page()
+        await page.route(LEGIT_IFRAME_URL, lambda r: asyncio.ensure_future(_route_fixed_body(r, "<button>Legit Button</button>")))
+        await page.set_content(f"<h1>Host page</h1>{iframes}")
+        await page.wait_for_timeout(300)
+        assert len(page.frames) == 8  # main + 7 -- otherwise the cap test proves nothing
+        state = await get_page_state(page)
+        await browser.close()
+        return state
+
+
+def test_frame_filter_caps_at_five_child_frames():
+    state = asyncio.run(_load_frame_cap_state())
+    # each scanned frame gets its own "Legit Button" element (different frame-qualified
+    # ids) -- 7 identical legit iframes should only ever yield 5 of them
+    assert sum(1 for e in state.elements if e.name == "Legit Button") == 5
+
+
 def test_corner_button_still_clickable_through_overlay(form_state_with_overlay):
     _, clicked = form_state_with_overlay
     assert clicked is True

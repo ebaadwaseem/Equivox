@@ -31,6 +31,9 @@ class FakeContext:
     def on(self, *args, **kwargs):
         pass
 
+    async def route(self, *args, **kwargs):
+        pass
+
     async def new_page(self):
         return self.page
 

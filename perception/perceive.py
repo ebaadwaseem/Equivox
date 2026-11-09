@@ -17,24 +17,67 @@ from playwright.async_api import Page
 
 from shared.protocol import Element, PageState
 from backend.choices import page_suggestions
+from perception.adblock import is_ad_or_tracker
 
 OBSERVER_JS = (Path(__file__).parent / "observer.js").read_text()
 
 logger = logging.getLogger("perception")
+
+# A child frame is only worth scanning if it's a real piece of UI, not a 1x1 tracking
+# pixel or a slim ad slot -- and even then, capped, so one ad-heavy page with dozens
+# of iframes can't blow up snapshot time one slow/hung frame at a time.
+MIN_FRAME_WIDTH = 200
+MIN_FRAME_HEIGHT = 100
+MAX_CHILD_FRAMES = 5
+FRAME_EVALUATE_TIMEOUT_S = 0.15
+
+
+async def _eligible_child_frame_indices(page: Page) -> tuple[list[int], int, int, int]:
+    """Indices into page.frames (NOT a re-numbered list -- callers like
+    executor.act.target_locator resolve a frame-qualified element id straight back
+    through page.frames[N]) of child frames worth scanning. Returns
+    (indices, skipped_as_ad, skipped_as_too_small_or_detached, skipped_over_cap)."""
+    eligible: list[int] = []
+    skipped_ad = 0
+    skipped_size = 0
+    for i, frame in enumerate(page.frames):
+        if i == 0:
+            continue  # the main frame is always scanned separately
+        if is_ad_or_tracker(frame.url):
+            skipped_ad += 1
+            continue
+        try:
+            element = await frame.frame_element()
+            box = await element.bounding_box()
+        except Exception:
+            skipped_size += 1
+            continue
+        if not box or box["width"] < MIN_FRAME_WIDTH or box["height"] < MIN_FRAME_HEIGHT:
+            skipped_size += 1
+            continue
+        eligible.append(i)
+    skipped_capped = max(0, len(eligible) - MAX_CHILD_FRAMES)
+    return eligible[:MAX_CHILD_FRAMES], skipped_ad, skipped_size, skipped_capped
 
 
 async def get_page_state(page: Page, with_screenshot: bool = False) -> PageState:
     t0 = time.perf_counter()
     async def observe(frame, index):
         try:
-            raw = await frame.evaluate(OBSERVER_JS)
+            raw = await asyncio.wait_for(frame.evaluate(OBSERVER_JS), timeout=FRAME_EVALUATE_TIMEOUT_S)
             return [Element(**(e | {"id": f"f{index}:{e['id']}"} if index else e)) for e in raw]
+        except asyncio.TimeoutError:
+            logger.debug("get_page_state: frame %s timed out after %.0fms, skipping",
+                        frame.url, FRAME_EVALUATE_TIMEOUT_S * 1000)
+            return []
         except Exception:
             if index == 0:
                 raise
             return []  # detached or inaccessible frame
 
-    groups = await asyncio.gather(*(observe(frame, i) for i, frame in enumerate(page.frames)))
+    child_indices, skipped_ad, skipped_size, skipped_capped = await _eligible_child_frame_indices(page)
+    indices_to_scan = [0, *child_indices]
+    groups = await asyncio.gather(*(observe(page.frames[i], i) for i in indices_to_scan))
     elements = [e for group in groups for e in group]
     shot = None
     if with_screenshot:
@@ -53,7 +96,12 @@ async def get_page_state(page: Page, with_screenshot: bool = False) -> PageState
         .slice(0,12).map(el => el.innerText.slice(0,120)).join(' | ')""")
     state = PageState(url=page.url, title=await page.title(), elements=elements, screenshot_b64=shot, summary=summary)
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    logger.debug("get_page_state: %d elements in %.1f ms (%s)", len(elements), elapsed_ms, page.url)
+    logger.info(
+        "get_page_state: %d elements in %.1f ms (%s) -- frames scanned=%d (main+%d child), "
+        "skipped ad=%d too-small/detached=%d over-cap=%d",
+        len(elements), elapsed_ms, page.url, len(indices_to_scan), len(child_indices),
+        skipped_ad, skipped_size, skipped_capped,
+    )
     return state
 
 

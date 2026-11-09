@@ -8,6 +8,15 @@
 //
 // Public API: window.__vox = { set(state, text, level, minimized), setLevel(level) }
 (() => {
+  // add_init_script runs in EVERY frame, including every ad iframe on the page --
+  // without this, an ad-heavy site ends up with one Vox mascot per ad slot and the
+  // browser visibly lags. Cross-origin iframes throw just reading window.top, which
+  // itself proves this isn't the top frame -- treat that the same as "not top".
+  try {
+    if (window.top !== window.self) return;
+  } catch {
+    return;
+  }
   if (window.__voxMounting && (!window.__vox || document.getElementById("vox-host"))) return;
   window.__voxMounting = true;
 
