@@ -6,7 +6,9 @@ import asyncio
 import logging
 import os
 import re
+import statistics
 import time
+from collections import deque
 from typing import Optional
 from urllib.parse import urlsplit
 
@@ -50,6 +52,8 @@ ERROR_REVERT_S = 4.0
 PAUSE_LISTENING_PHRASES = {"stop listening", "pause listening"}
 RESUME_LISTENING_PHRASES = {"start listening", "resume listening"}
 TOGGLE_LISTENING_PHRASES = {"toggle listening"}
+SHOW_STATS_PHRASES = {"show stats", "show latency", "show latency stats"}
+LATENCY_SAMPLE_WINDOW = 200  # running median over the last N actions, not the whole session
 
 
 def _site_of(url: str) -> str:
@@ -131,6 +135,15 @@ async def main() -> None:
         buffered_transcripts: dict[int, Transcript] = {}
         silence_task: Optional[asyncio.Task] = None
 
+        # latency tracking: first_seen_ts[id] is set on the very first message (partial
+        # or final) for that physical utterance id; final_seen_ts[id] only once is_final
+        # arrives. run_action() reads both against its own start time, logs one line, and
+        # feeds a running median -- "show stats" prints it on demand.
+        first_seen_ts: dict[int, float] = {}
+        final_seen_ts: dict[int, float] = {}
+        first_partial_latencies: deque = deque(maxlen=LATENCY_SAMPLE_WINDOW)
+        final_latencies: deque = deque(maxlen=LATENCY_SAMPLE_WINDOW)
+
         def quiet_ms(utterance_id) -> float:
             # Mic levels and transcript changes are separate signals. Missing ASR
             # updates must not be mistaken for silence in the middle of a query.
@@ -170,11 +183,20 @@ async def main() -> None:
             last_command_ts = time.time()
             await undo.push_checkpoint(checkpoints, page or active_page)
 
-        async def run_action(d: Decision, target_name: str = "", turn: Optional[Turn] = None) -> None:
+        async def run_action(d: Decision, target_name: str = "", turn: Optional[Turn] = None,
+                              physical_id: Optional[int] = None) -> None:
             nonlocal active_page, last_scroll, pending
             action_page = active_page
             await vox.set_options(action_page, [])
             action_started = time.perf_counter()
+            if physical_id is not None:
+                first_ms = (action_started - first_seen_ts.pop(physical_id, action_started)) * 1000
+                final_ms = (action_started - final_seen_ts.pop(physical_id, action_started)) * 1000
+                first_partial_latencies.append(first_ms)
+                final_latencies.append(final_ms)
+                print(f"  ⏱ latency: first heard→action {first_ms:.0f}ms, final→action {final_ms:.0f}ms", flush=True)
+                logger.info("latency id=%s first_partial_to_action_ms=%.0f final_to_action_ms=%.0f",
+                            physical_id, first_ms, final_ms)
             await mark_user_command(action_page)
             try:
                 page_before = {"url": action_page.url, "title": await action_page.title()}
@@ -251,14 +273,15 @@ async def main() -> None:
             action_queue.append(fn)
             action_wake.set()
 
-        def submit_action(d: Decision, target_name: str, turn: Optional[Turn] = None) -> None:
+        def submit_action(d: Decision, target_name: str, turn: Optional[Turn] = None,
+                          physical_id: Optional[int] = None) -> None:
             expected_page = active_page
             async def run_reserved():
                 if active_page is not expected_page:
                     context.finish(turn, "failed: active tab changed")
                     await vox.set(active_page, "unsure", "The active tab changed. Please repeat the command.")
                     return
-                await run_action(d, target_name, turn)
+                await run_action(d, target_name, turn, physical_id)
             submit_call(run_reserved)
 
         async def action_worker() -> None:
@@ -408,6 +431,10 @@ async def main() -> None:
                 silence_task = None
 
             physical_id = t.id
+            if physical_id is not None:
+                first_seen_ts.setdefault(physical_id, t_start)
+                if t.is_final:
+                    final_seen_ts[physical_id] = t_start
             raw_text = " ".join(t.text.split())
             t = Transcript(raw_text, t.is_final, t.confidence, t.id, t.silent_ms)
             # Keep the physical transcript throughout buffering and continuation.
@@ -461,6 +488,18 @@ async def main() -> None:
                 buffered_transcripts[physical_id] = latest_transcripts.get(physical_id, physical)
 
             # UI-only meta-commands: deterministic, never go through Jev.
+            if text_norm in SHOW_STATS_PHRASES:
+                if first_partial_latencies:
+                    print(
+                        f"  📊 latency (n={len(first_partial_latencies)}): "
+                        f"first heard→action median={statistics.median(first_partial_latencies):.0f}ms, "
+                        f"final→action median={statistics.median(final_latencies):.0f}ms",
+                        flush=True,
+                    )
+                else:
+                    print("  📊 no latency samples yet", flush=True)
+                pending = None
+                return
             if text_norm in PAUSE_LISTENING_PHRASES or (
                 text_norm in TOGGLE_LISTENING_PHRASES and not listening_paused
             ):
@@ -576,7 +615,7 @@ async def main() -> None:
                                 await vox.set_then_idle_after(active_page, "acting", outcome)
                             submit_call(visual_click)
                         else:
-                            submit_action(choice.decision, choice.label, turn)
+                            submit_action(choice.decision, choice.label, turn, physical_id)
                         return
                     if explicit_option(t.text):
                         await vox.set(active_page, "unsure", f"Choose an option from 1 to {len(session.choices)}.")
@@ -608,14 +647,14 @@ async def main() -> None:
                 pending = None
                 turn = context.commit(t.text, quick)
                 consume_and_continue()
-                submit_action(quick, "", turn)
+                submit_action(quick, "", turn, physical_id)
                 return
 
             # explicit phrases skip inference entirely
             if text_norm in PREV_TAB_PHRASES:
                 turn = context.commit(t.text, Decision(True, "switch_tab", text="previous"), "previous tab")
                 consume_and_continue()
-                submit_action(Decision(True, "switch_tab", text="previous"), "previous tab", turn)
+                submit_action(Decision(True, "switch_tab", text="previous"), "previous tab", turn, physical_id)
                 pending = None
                 return
             if text_norm in PREV_PAGE_PHRASES:
@@ -650,7 +689,7 @@ async def main() -> None:
                 repeat_decision = last_scroll or Decision(True, "scroll", scroll_amount=spans.DEFAULT_SCROLL_FRACTION)
                 turn = context.commit(t.text, repeat_decision)
                 consume_and_continue()
-                submit_action(repeat_decision, "", turn)
+                submit_action(repeat_decision, "", turn, physical_id)
                 pending = None
                 return
 
@@ -668,7 +707,7 @@ async def main() -> None:
                     if confirmed_id in latest_transcripts:
                         buffered_transcripts[confirmed_id] = latest_transcripts[confirmed_id]
                     context.consume(physical_id, prefix)
-                    submit_action(d, pending.get("target_name", ""), turn)
+                    submit_action(d, pending.get("target_name", ""), turn, physical_id)
                     pending = None
                     return
                 if text_norm in DENY:
@@ -703,7 +742,7 @@ async def main() -> None:
                         buffered_transcripts[confirmed_id] = latest_transcripts[confirmed_id]
                     context.consume(physical_id, prefix)
                     pending = None
-                    submit_action(d, candidates[n - 1].name, turn)
+                    submit_action(d, candidates[n - 1].name, turn, physical_id)
                     return
                 if not t.is_final and not bounded:
                     return
@@ -866,7 +905,7 @@ async def main() -> None:
                 pending = None  # a fresh command supersedes any confirmation still open
                 turn = context.commit(t.text, d, target_name)
                 consume_and_continue()
-                submit_action(d, target_name, turn)
+                submit_action(d, target_name, turn, physical_id)
 
         sched = Scheduler(handle)
 
@@ -1012,6 +1051,8 @@ async def main() -> None:
                         latest_transcripts.pop(oldest, None)
                         last_heard.pop(oldest, None)
                         decision_cache.pop(oldest, None)
+                        first_seen_ts.pop(oldest, None)
+                        final_seen_ts.pop(oldest, None)
         finally:
             for task in tasks:
                 task.cancel()
