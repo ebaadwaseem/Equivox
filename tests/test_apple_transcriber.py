@@ -1,7 +1,6 @@
 """Exercises audio/apple_transcriber.py against tests/fakes/fake_listen.py (a scripted
 fake of the Swift listener) -- no microphone, no Speech framework, no real subprocess
-binary required. Covers the subprocess-management half of the voice input feature; the
-early-commit decision logic itself is unit-tested in tests/test_early_commit.py.
+binary required.
 """
 import asyncio
 import sys

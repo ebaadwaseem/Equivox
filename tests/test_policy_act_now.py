@@ -43,6 +43,34 @@ def test_low_target_probability_asks_for_disambiguation():
     assert policy.decide_outcome(d, is_final=False) == "DISAMBIGUATE"
 
 
+def test_commit_confidence_threshold_gates_click_type_select():
+    # below COMMIT_CONFIDENCE_THRESHOLD (0.60) but above the looser ambiguous-gap
+    # thresholds (0.45/0.35) -- would have wrongly COMMIT-ed before this was wired in
+    for intent in ("click", "type", "select"):
+        d = _d(intent, target_id="e1", text="x", target_top_prob=0.5, target_confidence=0.5)
+        assert policy.decide_outcome(d, is_final=True) == "DISAMBIGUATE"
+
+
+def test_commit_confidence_threshold_on_low_intent_confidence():
+    # 0.58 is between INTENT_CONFIDENCE_THRESHOLD (0.55, an earlier/looser WAIT gate)
+    # and COMMIT_CONFIDENCE_THRESHOLD (0.60) -- isolates this specific new check
+    d = _d("click", intent_confidence=0.58)
+    assert policy.decide_outcome(d, is_final=True) == "DISAMBIGUATE"
+
+
+def test_commit_confidence_threshold_does_not_affect_other_intents():
+    # scroll/search/etc. never had this gate and still don't -- only click/type/select
+    d = _d("scroll", target_id=None, target_top_prob=0.5, intent_confidence=0.58)
+    assert policy.decide_outcome(d, is_final=True) == "COMMIT"
+
+
+def test_commit_confidence_threshold_exempt_for_deterministic_target():
+    # ordinals/form_entry/shortcuts set target_top_prob/intent_confidence to 1.0 --
+    # this is really just confirming the default-exemption, not a special-case flag
+    d = _d("click", target_top_prob=1.0, target_confidence=1.0, intent_confidence=1.0)
+    assert policy.decide_outcome(d, is_final=True) == "COMMIT"
+
+
 def test_free_text_waits_for_final_or_silence():
     d = _d("search", target_id=None, text="pizza", payload_bounded=False)
     result = policy.evaluate(d, is_final=False)

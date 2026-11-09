@@ -84,6 +84,16 @@ def evaluate(d: Decision, is_final: bool, silent_ms: float = 0.0, stale: bool = 
     ):
         return PolicyResult("DISAMBIGUATE")
 
+    # A stricter bar for the three intents that physically act ON a target: even once
+    # the target "wins" the race above, a low-confidence pick for click/type/select
+    # (the model is unsure WHICH element, or unsure this is even the right intent)
+    # asks instead of guessing. Deterministic targets (ordinals, form_entry, shortcuts)
+    # are naturally exempt -- they set target_top_prob/intent_confidence to 1.0.
+    if d.intent in {"click", "type", "select"} and (
+        d.intent_confidence < COMMIT_CONFIDENCE_THRESHOLD or d.target_top_prob < COMMIT_CONFIDENCE_THRESHOLD
+    ):
+        return PolicyResult("DISAMBIGUATE")
+
     silent = silent_ms >= SILENCE_COMPLETE_MS or is_final
     if d.act_now not in ("clause_complete", "utterance_complete"):
         if not silent:
