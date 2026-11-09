@@ -140,6 +140,10 @@ def extract_url_candidates(transcript: str) -> list[str]:
         if key in SITE_ALIASES and SITE_ALIASES[key] not in out:
             out.append(SITE_ALIASES[key])
 
+    if phrase := _extract_new_tab_site_phrase(transcript):
+        if (resolved := _resolve_site_or_domain(phrase)) and resolved not in out:
+            out.append(resolved)
+
     return out[:6]
 
 
@@ -278,9 +282,6 @@ def extract_find_text(transcript: str) -> Optional[str]:
 _SWITCH_TAB_DIRECTION_RE = re.compile(r"^(?:switch to (?:the )?)?(next|previous|prev)\s*tab$", re.I)
 _SWITCH_TAB_NAMED_WITH_RE = re.compile(r"^switch to (?:the )?tab (?:with|called|named)\s+(.+)$", re.I)
 _SWITCH_TAB_NAMED_SUFFIX_RE = re.compile(r"^switch to (?:the )?(.+?)\s+tab$", re.I)
-_NEW_TAB_URL_RE = re.compile(r"\bto\s+(\S+\.\S+)", re.I)
-
-
 def extract_tab_switch_query(transcript: str) -> Optional[str]:
     """"next tab" -> "next" ; "switch to the tab with gmail" / "...the gmail tab" -> "gmail" """
     t = transcript.strip()
@@ -296,10 +297,45 @@ def extract_tab_switch_query(transcript: str) -> Optional[str]:
     return None
 
 
+# "...tab to/with SITE" ("open a new tab to youtube", "new tab with wikipedia") and
+# "open SITE in a new tab" are the two word orders people actually say; a bare site
+# name needs resolving (SITE_ALIASES, or "<word>.com" as a last resort), an
+# already-dotted domain is used as-is.
+_NEW_TAB_AFTER_RE = re.compile(r"\btab\s+(?:to|with)\s+(.+)$", re.I)
+_NEW_TAB_BEFORE_RE = re.compile(r"^open\s+(.+?)\s+in\s+(?:a\s+)?new\s+tab\b", re.I)
+
+
+def _extract_new_tab_site_phrase(transcript: str) -> Optional[str]:
+    t = transcript.strip()
+    if m := _NEW_TAB_BEFORE_RE.match(t):
+        return m.group(1).strip()
+    if m := _NEW_TAB_AFTER_RE.search(t):
+        return re.split(r"[,;]", m.group(1), maxsplit=1)[0].strip()
+    return None
+
+
+def _resolve_site_or_domain(phrase: str) -> Optional[str]:
+    """A known site alias ("youtube" -> youtube.com), an already-dotted domain used
+    as-is, or -- last resort, only for a single bare word -- "<word>.com"."""
+    key = phrase.strip().strip(".,!?\"'").lower()
+    if not key:
+        return None
+    if key in SITE_ALIASES:
+        return SITE_ALIASES[key]
+    if " " not in key:
+        if "." in key:
+            return key
+        if re.fullmatch(r"[a-z][a-z0-9-]*", key):
+            return f"{key}.com"
+    return None
+
+
 def extract_new_tab_url(transcript: str) -> Optional[str]:
-    """"open a new tab to wikipedia.org" -> "wikipedia.org" ; "open a new tab" -> None"""
-    m = _NEW_TAB_URL_RE.search(transcript)
-    return m.group(1).strip(".,!?") if m else None
+    """"open a new tab to wikipedia.org" -> "wikipedia.org"; "new tab with wikipedia"
+    and "open youtube in a new tab" -> resolved via SITE_ALIASES; "open a new tab"
+    (no site named) -> None."""
+    phrase = _extract_new_tab_site_phrase(transcript)
+    return _resolve_site_or_domain(phrase) if phrase else None
 
 
 # ---- accessibility -----------------------------------------------------------------------

@@ -11,6 +11,7 @@ from backend.spans import (
     extract_tab_switch_query,
     extract_type_text,
     extract_url,
+    extract_url_candidates,
     is_scroll_repeat,
 )
 
@@ -170,6 +171,26 @@ def test_extract_new_tab_url_present():
 
 def test_extract_new_tab_url_absent():
     assert extract_new_tab_url("open a new tab") is None
+
+
+def test_extract_new_tab_url_bare_site_name_via_alias():
+    assert extract_new_tab_url("open a new tab to youtube") == "youtube.com"
+
+
+def test_extract_new_tab_url_with_phrasing():
+    assert extract_new_tab_url("new tab with wikipedia") == "wikipedia.org"
+
+
+def test_extract_new_tab_url_site_before_in_new_tab_phrasing():
+    assert extract_new_tab_url("open youtube in a new tab") == "youtube.com"
+
+
+def test_extract_new_tab_url_single_word_last_resort_dot_com():
+    assert extract_new_tab_url("open a new tab to notion") == "notion.com"
+
+
+def test_extract_new_tab_url_candidates_includes_resolved_site():
+    assert "youtube.com" in extract_url_candidates("open a new tab to youtube")
 
 
 def test_extract_accessibility_bigger():
