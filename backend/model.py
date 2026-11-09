@@ -68,6 +68,7 @@ async def decide(
     context=None,
     pending_confirmation: Optional[str] = None,
     silent_ms: float = 0.0,
+    viewport: Optional[tuple[int, int]] = None,
 ) -> Decision:
     if entry := form_entry(transcript, elements):
         entry.act_now = "utterance_complete" if is_final or silent_ms >= policy.PAYLOAD_SILENCE_MS else "incomplete"
@@ -93,8 +94,12 @@ async def decide(
         # OpenRouter's multimodal decision state; opt-in for a vision-capable model.
         state = [{"type": "text", "text": state},
                  {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + page["screenshot_b64"]}}]
-    # Descriptions already live in ELEMENTS, including options/focus/geometry.
-    criteria = {e.id: None for e in elements} | {"none": "No observed element is referred to"}
+    # Each candidate's own criteria value carries a short description (role, name,
+    # geometry) -- the same thing ELEMENTS: in the state text already says in full,
+    # but Jev's "choice" criteria are themselves part of what the model is shown, so a
+    # bare id with no value gives the model nothing to go on if it doesn't fully use
+    # the elements block.
+    criteria = build_choice_criteria(elements, viewport) | {"none": "No observed element is referred to"}
     questions: dict = {
         "act_now": {
             "type": "choice",

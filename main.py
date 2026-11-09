@@ -803,7 +803,7 @@ async def main() -> None:
             else:
                 d = await decide(
                     t.text, t.is_final or bounded, prompt_text, cands,
-                    page=page_info, context=context,
+                    page=page_info, context=context, viewport=vp,
                     pending_confirmation=pending_confirmation, silent_ms=t.silent_ms,
                 )
                 # The no-key fallback deliberately waits for final/silence and
