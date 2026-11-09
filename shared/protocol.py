@@ -38,6 +38,7 @@ class Element:
     description: str = ""  # nearby result/card text and accessibility descriptions
     is_video_link: bool = False
     suggestion_group: str = ""  # visible autocomplete popup owned by an input
+    is_search_result: bool = False  # a result-title link on a search-results page (DDG/Google/generic)
 
 
 @dataclass

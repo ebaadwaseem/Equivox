@@ -119,6 +119,31 @@
     } catch { return null; }
   }
 
+  // "open the first one"/"click the first result" must land on an actual result,
+  // never the search engine's own logo/home link or a link back to this same
+  // results page -- both of which sit earlier in DOM order than the real results
+  // on DuckDuckGo's static HTML results page.
+  function isOwnRootOrSearchPage(el) {
+    if (!el.href) return false;
+    try {
+      const u = new URL(el.href, location.href);
+      if (u.hostname !== location.hostname) return false;
+      if (u.pathname === '/' || u.pathname === '') return true; // site root
+      if (u.pathname === location.pathname && !u.search) return true; // e.g. DDG's /html/ logo link
+      return false;
+    } catch { return false; }
+  }
+
+  function isSearchResultLink(el) {
+    if (el.tagName !== 'A' || isOwnRootOrSearchPage(el)) return false;
+    if (el.matches('a.result__a')) return true; // DuckDuckGo HTML results
+    if (el.querySelector('h3')) return true; // Google-style: <a><h3>Title</h3></a>
+    // generic: a link inside a container actually labeled as a result (post-dedup,
+    // sibling icon/url-text links to the same destination are already gone -- see
+    // hrefSeen above -- so whichever link survived here needs no extra length check).
+    return !!el.closest('[class*="result" i], [id*="result" i]');
+  }
+
   function isHomepageLink(el) {
     if (!el.href) return false;
     try {
@@ -258,6 +283,7 @@
       id: el.dataset.vbId, role, name,
       suggestion_group: suggestionRows.get(el) || '',
       is_video_link: tag === 'a' && /\/(?:watch\?|shorts\/)/.test(el.href || ''),
+      is_search_result: role === 'link' && isSearchResultLink(el),
       description: clean(labels.slice(1).join(' ')) || clean((el.getAttribute('aria-describedby') || '').split(/\s+/)
         .map(id => el.getRootNode().getElementById(id)?.textContent || '').join(' ')) ||
         clean(el.closest('[role="article"]')?.innerText || ''),

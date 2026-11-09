@@ -12,6 +12,7 @@ from shared.protocol import Element, PageState
 FORM_FIXTURE = (Path(__file__).parent / "fixtures" / "pages" / "form.html").resolve().as_uri()
 RESULTS_FIXTURE = (Path(__file__).parent / "fixtures" / "pages" / "results.html").resolve().as_uri()
 SEARCH_FIXTURE = (Path(__file__).parent / "fixtures" / "pages" / "search.html").resolve().as_uri()
+DDG_FIXTURE = (Path(__file__).parent / "fixtures" / "pages" / "ddg_results.html").resolve().as_uri()
 OVERLAY_JS = (Path(__file__).parent.parent / "ui" / "overlay.js").read_text()
 
 
@@ -296,6 +297,58 @@ def test_ordinal_link_excludes_no_text_icon_link_outside_chrome(results_state):
     assert icon.in_chrome is False
     first_link = find_deterministic_target(results_state.elements, "click the first link")
     assert first_link.id != icon.id
+
+
+# ---- observer.js extraction against REAL duckduckgo.com/html/ markup --------------------
+# Fixture is a trimmed, faithful copy of actual fetched DDG HTML (fetched 2026-11), kept
+# with its real class names (result__a, result__title, ...) and its real header logo link
+# (href="/html/", title="DuckDuckGo") -- the exact element "open the first one" picked by
+# mistake before this fix, since it's the first <a> on the page and (unlike a plain "/"
+# homepage link) wasn't caught by is_homepage_link's exact-root-path check.
+
+async def _load_ddg_state() -> PageState:
+    async with async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page()
+        await page.goto(DDG_FIXTURE)
+        state = await get_page_state(page)
+        await browser.close()
+        return state
+
+
+@pytest.fixture(scope="module")
+def ddg_state() -> PageState:
+    return asyncio.run(_load_ddg_state())
+
+
+def test_ddg_logo_link_is_not_flagged_a_search_result(ddg_state):
+    logo = next(e for e in ddg_state.elements if e.role == "link" and e.name == "DuckDuckGo")
+    assert logo.is_search_result is False
+
+
+def test_ddg_real_result_links_are_flagged_search_results(ddg_state):
+    titles = [e.name for e in ddg_state.elements if e.is_search_result]
+    assert titles == [
+        "THE BEST 10 PHYSICAL THERAPY IN EDMONTON, AB - (2026 GUIDE) - Yelp",
+        "The 40 Best Physiotherapists in Edmonton [2026 ]",
+        "Edmonton Physio - Treating Clients in Downtown Edmonton for over 40 Years",
+    ]
+
+
+def test_ddg_open_the_first_one_picks_the_real_first_result(ddg_state):
+    # the exact phrase that used to click the DuckDuckGo logo link instead
+    first = find_deterministic_target(ddg_state.elements, "open the first one")
+    assert first.name == "THE BEST 10 PHYSICAL THERAPY IN EDMONTON, AB - (2026 GUIDE) - Yelp"
+
+
+def test_ddg_open_the_second_result(ddg_state):
+    second = find_deterministic_target(ddg_state.elements, "open the second result")
+    assert second.name == "The 40 Best Physiotherapists in Edmonton [2026 ]"
+
+
+def test_ddg_click_the_third_result(ddg_state):
+    third = find_deterministic_target(ddg_state.elements, "click the third result")
+    assert third.name == "Edmonton Physio - Treating Clients in Downtown Edmonton for over 40 Years"
 
 
 # ---- the Vox overlay must never block or appear as a page element ------

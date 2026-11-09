@@ -124,6 +124,9 @@ def _dom_order(elements: list[Element]) -> list[Element]:
     return sorted(elements, key=lambda e: _id_num(e.id))
 
 
+_RESULT_WORDS = {"result", "results", "one", "ones", "link", "links"}
+
+
 def _find_ordinal_target(elements: list[Element], transcript: str) -> Optional[Element]:
     """"second link", "third result", "last field" -> the Nth element of that role."""
     words = [w.strip(".,!?") for w in transcript.lower().split()]
@@ -131,19 +134,30 @@ def _find_ordinal_target(elements: list[Element], transcript: str) -> Optional[E
     if ordinal_n is None:
         return None
     roles = _find_role_filter(transcript)
-    candidates = [e for e in _dom_order(elements) if roles is None or e.role in roles]
-    if "video" in words or "videos" in words:
-        candidates = [e for e in candidates if e.is_video_link]
-    elif any(w in words for w in ("option", "options", "choose", "select")):
-        suggestions = page_suggestions(elements) or [e for e in candidates if e.role == "option" and e.in_viewport]
-        if suggestions:
-            candidates = suggestions
-    if roles is not None and "link" in roles:
-        # "first link"/"second result" etc. means a real, nameable piece of content --
-        # never the header/nav/footer chrome around it, an icon-only link with no text,
-        # or a logo link back to the site's own homepage. A site logo is technically the
-        # page's first <a>, but nobody means that when they say "the first link".
-        candidates = [e for e in candidates if not e.in_chrome and e.name.strip() and not e.is_homepage_link]
+
+    # "open the first one"/"click the first result" on a search-results page (DDG,
+    # Google, or a generic results container) means an actual result title, never
+    # the search engine's own logo/nav link -- which otherwise sits earlier in DOM
+    # order than any real result. observer.js already excludes the site's own
+    # root/search-page links from is_search_result, so no further filtering is
+    # needed once this branch applies.
+    search_results = [e for e in _dom_order(elements) if e.is_search_result]
+    if search_results and (roles is None or "link" in roles) and any(w in words for w in _RESULT_WORDS):
+        candidates = search_results
+    else:
+        candidates = [e for e in _dom_order(elements) if roles is None or e.role in roles]
+        if "video" in words or "videos" in words:
+            candidates = [e for e in candidates if e.is_video_link]
+        elif any(w in words for w in ("option", "options", "choose", "select")):
+            suggestions = page_suggestions(elements) or [e for e in candidates if e.role == "option" and e.in_viewport]
+            if suggestions:
+                candidates = suggestions
+        if roles is not None and "link" in roles:
+            # "first link"/"second result" etc. means a real, nameable piece of content --
+            # never the header/nav/footer chrome around it, an icon-only link with no text,
+            # or a logo link back to the site's own homepage. A site logo is technically the
+            # page's first <a>, but nobody means that when they say "the first link".
+            candidates = [e for e in candidates if not e.in_chrome and e.name.strip() and not e.is_homepage_link]
     if not candidates:
         return None
     if ordinal_n == -1:
