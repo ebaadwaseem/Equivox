@@ -1,5 +1,6 @@
 """Browser regressions for real controls, open shadow roots, frames, and history."""
 import asyncio
+from pathlib import Path
 
 from playwright.async_api import async_playwright
 
@@ -131,3 +132,26 @@ def test_overlay_keeps_long_speech_and_history_inside_viewport():
             await page.screenshot(path='/tmp/equivox-overlay.png')
             await browser.close()
     asyncio.run(run())
+
+
+SECOND_FIXTURE = (Path(__file__).parent / "fixtures" / "pages" / "second.html").resolve().as_uri()
+
+
+def test_click_that_navigates_reports_navigated_not_failed():
+    # A click that navigates (or detaches its own element) is a SUCCESS -- it must
+    # never be reported as "action failed" just because the element is gone afterward.
+    async def run():
+        async with async_playwright() as p:
+            browser = await p.chromium.launch()
+            page = await browser.new_page()
+            await page.set_content(f'<a href="{SECOND_FIXTURE}" data-vb-id="e01">Go to second page</a>')
+            d = Decision(True, "click", target_id="e01")
+            result = await execute(page, d)
+            final_url = page.url
+            await browser.close()
+            return result, final_url
+
+    result, final_url = asyncio.run(run())
+    assert result.startswith("navigated to")
+    assert "second.html" in result
+    assert "second.html" in final_url

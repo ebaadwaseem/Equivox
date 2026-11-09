@@ -3,6 +3,7 @@ Code builds URLs; the model never writes them."""
 import asyncio
 import os
 import re
+import time
 from urllib.parse import quote_plus, urlsplit
 
 from playwright.async_api import BrowserContext, Page
@@ -76,6 +77,47 @@ async def select_value(page, locator, text: str) -> str:
     return f"selected {text}"
 
 
+async def _wait_for_navigation_or_settle(page: Page, url_before: str, fallback: str, timeout_s: float = 3.0) -> str:
+    """After a click dispatched with no_wait_after=True, wait here (not inside
+    click() itself) for the page to either navigate or settle back to a normal
+    DOM-ready state. A click that navigates would otherwise make Playwright's own
+    post-click actionability checks throw -- "Execution context was destroyed" --
+    purely because the click WORKED; no_wait_after skips those checks so that can
+    never happen, and this takes over reporting what actually occurred. A click that
+    just opens a menu (DOM changes, no navigation) settles almost immediately and
+    doesn't wait out the full timeout.
+    """
+    deadline = time.monotonic() + timeout_s
+    # a navigation triggered by the click hasn't necessarily STARTED yet the instant
+    # click() returns -- checking readyState immediately can see the OLD page still
+    # sitting there at "complete" and wrongly conclude nothing is happening.
+    await asyncio.sleep(0.05)
+    while time.monotonic() < deadline:
+        if page.url != url_before:
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=max(50, (deadline - time.monotonic()) * 1000))
+            except Exception:
+                pass
+            return f"navigated to {_short_url(page.url)}"
+        try:
+            ready = await page.evaluate("() => document.readyState")
+        except Exception:
+            # the execution context was just torn down -- a navigation is in flight
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=max(50, (deadline - time.monotonic()) * 1000))
+            except Exception:
+                pass
+            return f"navigated to {_short_url(page.url)}"
+        if ready == "complete":
+            break  # settled with no navigation: a normal click, or a DOM-only change
+        await asyncio.sleep(0.05)
+    return fallback
+
+
+def _short_url(url: str) -> str:
+    return url.removeprefix("https://").removeprefix("http://").removeprefix("www.")[:80]
+
+
 async def execute(page: Page, d: Decision) -> str:
     sel = target_locator(page, d.target_id) if d.target_id else None
     match d.intent:
@@ -85,7 +127,10 @@ async def execute(page: Page, d: Decision) -> str:
                 # enabled options in Vox instead, using select_option to choose.
                 await sel.focus()
                 return "opened native dropdown"
-            await sel.click(timeout=3000)
+            url_before = page.url
+            await sel.click(timeout=3000, no_wait_after=True)
+            fallback = f"did click {d.target_id or d.text or ''}".strip()
+            return await _wait_for_navigation_or_settle(page, url_before, fallback)
         case "type" if sel:
             # Some widgets put the observed role on a wrapper around the input.
             if not await sel.evaluate("el => el.matches('input,textarea') || el.isContentEditable"):
