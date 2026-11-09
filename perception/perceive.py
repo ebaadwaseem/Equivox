@@ -9,6 +9,7 @@ import re
 import time
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 
 from playwright.async_api import Page
 
@@ -196,6 +197,36 @@ def find_deterministic_target(elements: list[Element], transcript: str) -> Optio
     link" versus any other link.
     """
     return _find_ordinal_target(elements, transcript) or _find_next_field(elements, transcript)
+
+
+# ---- the current page's own search box (vs. an external web search) --------------------
+
+_GENERIC_SEARCH_ENGINES = (
+    "duckduckgo.com", "google.com", "bing.com", "search.brave.com", "yahoo.com",
+    "ecosia.org", "startpage.com",
+)
+_SEARCH_BOX_NAMES = {"q", "query", "search", "search_query"}
+
+
+def _is_generic_search_engine(url: str) -> bool:
+    host = (urlsplit(url).hostname or "").removeprefix("www.")
+    return any(host == eng or host.endswith("." + eng) for eng in _GENERIC_SEARCH_ENGINES)
+
+
+def find_own_search_box(elements: list[Element], url: str) -> Optional[Element]:
+    """"search for X" types into the CURRENT page's own search box (input[type=search],
+    or an input named q/query/search/search_query) instead of leaving to an external web
+    search -- but never on a page that IS itself a generic search engine, since "search
+    for X" already defaults to a web search there."""
+    if _is_generic_search_engine(url):
+        return None
+    candidates = [
+        e for e in elements
+        if e.role == "textbox" and (e.input_type == "search" or (e.input_name or "").lower() in _SEARCH_BOX_NAMES)
+    ]
+    if not candidates:
+        return None
+    return next((e for e in candidates if e.active), candidates[0])
 
 
 def _lexical_score(e: Element, words: set[str]) -> int:

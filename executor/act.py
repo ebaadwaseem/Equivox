@@ -11,6 +11,13 @@ from shared.protocol import Decision
 
 _HIGH_CONTRAST_STYLE_ID = "vb-high-contrast"
 
+# "search youtube/wikipedia/amazon for X" -- code builds the URL, the model never does.
+SEARCH_SITE_URLS = {
+    "youtube": "https://www.youtube.com/results?search_query={q}",
+    "wikipedia": "https://en.wikipedia.org/w/index.php?search={q}",
+    "amazon": "https://www.amazon.com/s?k={q}",
+}
+
 
 def navigation_url(text: str) -> str:
     """Validate before touching the browser; search queries never become bare URLs."""
@@ -122,13 +129,22 @@ async def execute(page: Page, d: Decision) -> str:
         case "navigate" if d.text:
             await page.goto(navigation_url(d.text), wait_until="domcontentloaded")
         case "search" if d.text:
-            # the plain duckduckgo.com/?q= form doesn't render results without JS; the
-            # static /html/ endpoint does and is faster to load.
-            if is_map_url(page.url):
-                url = f"https://www.google.com/maps/search/?api=1&query={quote_plus(d.text)}"
+            if d.search_site:
+                await page.goto(SEARCH_SITE_URLS[d.search_site].format(q=quote_plus(d.text)), wait_until="domcontentloaded")
+            elif sel:
+                # the current page's own search box (perception found it, not the model) --
+                # type into it directly rather than leaving for an external web search.
+                if not await sel.evaluate("el => el.matches('input,textarea')"):
+                    sel = sel.locator('input,textarea').first
+                await sel.fill(d.text, timeout=3000)
+                await sel.press("Enter", timeout=3000)
+                return f"Searched this page for {d.text}"
+            elif is_map_url(page.url):
+                # the plain duckduckgo.com/?q= form doesn't render results without JS; the
+                # static /html/ endpoint does and is faster to load.
+                await page.goto(f"https://www.google.com/maps/search/?api=1&query={quote_plus(d.text)}", wait_until="domcontentloaded")
             else:
-                url = f"https://duckduckgo.com/html/?q={quote_plus(d.text)}"
-            await page.goto(url, wait_until="domcontentloaded")
+                await page.goto(f"https://duckduckgo.com/html/?q={quote_plus(d.text)}", wait_until="domcontentloaded")
         case "find" if d.text:
             return await find_text(page, d.text)
         case "accessibility" if d.text:

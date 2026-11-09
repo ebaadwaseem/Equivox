@@ -14,7 +14,7 @@ from typing import Optional, get_args
 from backend import jev, policy, spans
 from backend.forms import form_entry
 from backend.state_builder import build_state_text
-from perception.perceive import build_choice_criteria, find_deterministic_target
+from perception.perceive import build_choice_criteria, find_deterministic_target, find_own_search_box
 from shared.protocol import Decision, Element, Intent
 
 logger = logging.getLogger("backend.model")
@@ -76,7 +76,7 @@ async def decide(
     key = os.getenv("OPENROUTER_API_KEY")
     model = os.getenv("VB_MODEL", "")
     if not key or not model:
-        d = _keyword_fallback(transcript, elements)
+        d = _keyword_fallback(transcript, elements, page)
         d.act_now = "utterance_complete" if is_final or silent_ms >= policy.SILENCE_COMPLETE_MS else "incomplete"
         d.complete = d.act_now == "utterance_complete"
         return d
@@ -168,7 +168,7 @@ async def decide(
     answers = await jev.ask(model, state, questions)
     logger.info("jev call: %.0f ms, answers=%s", (time.perf_counter() - t0) * 1000, "ok" if answers else "FAILED")
     if answers is None:
-        d = _keyword_fallback(transcript, elements)
+        d = _keyword_fallback(transcript, elements, page)
         d.act_now = "utterance_complete" if is_final or silent_ms >= policy.SILENCE_COMPLETE_MS else "incomplete"
         d.complete = d.act_now == "utterance_complete"
         return d
@@ -248,6 +248,18 @@ async def decide(
     if intent == "switch_tab":
         text_value = tab_text
 
+    # search routing: an explicit site ("search youtube for X") always wins; otherwise
+    # "search for X" types into the CURRENT page's own search box when it has one and
+    # isn't itself a generic search engine, unless the speaker explicitly forced a web
+    # search ("search the web for X" / "google X"). Deterministic -- never needs Jev.
+    search_site = None
+    if intent == "search" and text_value:
+        if site_search := spans.extract_site_search(transcript):
+            search_site, text_value = site_search
+        elif not spans.is_forced_web_search(transcript):
+            if own_box := find_own_search_box(elements, (page or {}).get("url", "")):
+                target_id = own_box.id
+
     destructive = policy.looks_destructive(target_name) or jev.noul(answers, "destructive") >= policy.DESTRUCTIVE_THRESHOLD
 
     scroll_to: Optional[str] = None
@@ -289,6 +301,7 @@ async def decide(
         payload_bounded=spans.is_comma_bounded(transcript, text_value or ""),
         target_top_prob=target_top_prob,
         target_probabilities={k: v for k, v in target_probs.items() if k in {e.id for e in elements}},
+        search_site=search_site,
     )
 
 
@@ -327,7 +340,7 @@ def _first(values: list[str]) -> Optional[str]:
     return values[0] if values else None
 
 
-def _keyword_fallback(transcript: str, elements: list[Element]) -> Decision:
+def _keyword_fallback(transcript: str, elements: list[Element], page: Optional[dict] = None) -> Decision:
     transcript = transcript.strip()
     t = transcript.lower()
     if t in ("back", "go back"):
@@ -350,7 +363,13 @@ def _keyword_fallback(transcript: str, elements: list[Element]) -> Decision:
             return Decision(True, "switch_tab", text=switch)
     if url := spans.extract_url(transcript):
         return Decision(True, "navigate", text=url)
+    if site_search := spans.extract_site_search(transcript):
+        site, query = site_search
+        return Decision(True, "search", text=query, search_site=site)
     if query := spans.extract_search_query(transcript):
+        if not spans.is_forced_web_search(transcript):
+            if own_box := find_own_search_box(elements, (page or {}).get("url", "")):
+                return Decision(True, "search", target_id=own_box.id, text=query)
         return Decision(True, "search", text=query)
     pinned = find_deterministic_target(elements, transcript)
     if value := spans.extract_select_value(transcript):

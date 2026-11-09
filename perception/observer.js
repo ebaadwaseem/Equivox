@@ -31,7 +31,13 @@
 
   function roleOf(el, tag) {
     const ariaRole = el.getAttribute('role');
-    if (ariaRole === 'combobox' || ariaRole === 'listbox') return 'select';
+    // the ARIA 1.2 EDITABLE combobox pattern (type-to-filter, e.g. YouTube's search
+    // box) is a real <input>/<textarea> that you type into -- a textbox, not a
+    // dropdown-trigger "select" -- which role=combobox otherwise correctly means for
+    // a non-input widget (a <div>/<button> that just opens a popup of options).
+    if (ariaRole === 'combobox' || ariaRole === 'listbox') {
+      return (tag === 'input' || tag === 'textarea') ? 'textbox' : 'select';
+    }
     if (ariaRole === 'searchbox' || el.isContentEditable) return 'textbox';
     if (ariaRole) return ariaRole;
     if (tag === 'a') return 'link';
@@ -290,6 +296,7 @@
       x: rect.x, y: rect.y, w: rect.w, h: rect.h,
       in_viewport: rect.y + rect.h > 0 && rect.y < innerHeight && rect.x + rect.w > 0 && rect.x < innerWidth,
       input_type: tag === 'select' ? 'select' : tag === 'textarea' ? 'textarea' : type,
+      input_name: el.getAttribute('name') || null,
       value: valueOf(el, tag, type),
       checked: (role === 'checkbox' || role === 'radio') ? !!el.checked : null,
       href_domain: role === 'link' ? hrefDomain(el) : null,

@@ -8,7 +8,11 @@ from typing import Optional
 _TYPE_RE = re.compile(
     r"^(?:type|write|enter|input)\s+(.+?)(?:\s+(?:in|into)\s+the\s+.+)?$", re.I
 )
-_SEARCH_RE = re.compile(r"^(?:search(?:\s+for)?|google|look\s+up)\s+(.+)$", re.I)
+# "search the web for"/"search online for"/"search duckduckgo for" are explicit
+# web-search phrasings (is_forced_web_search below); all collapse to the same bare query.
+_SEARCH_RE = re.compile(
+    r"^(?:search(?:\s+(?:for|the\s+web\s+for|online\s+for|duckduckgo\s+for))?|google|look\s+up)\s+(.+)$", re.I
+)
 _URL_RE = re.compile(r"^(?:go\s+to|open|navigate\s+to|visit|check)\s+(.+)$", re.I)
 _SELECT_RE = re.compile(r"^(?:select|choose|pick)\s+(.+)$", re.I)
 
@@ -159,6 +163,28 @@ def extract_search_query(transcript: str) -> Optional[str]:
     """"search for pizza near me" -> "pizza near me" """
     m = _SEARCH_RE.match(transcript.strip())
     return m.group(1).strip() if m else None
+
+
+# ---- search routing: the page's own search box vs. an explicit site vs. the web --------
+
+SEARCH_SITES = ("youtube", "wikipedia", "amazon")
+_SITE_SEARCH_RE = re.compile(rf"^search\s+({'|'.join(SEARCH_SITES)})\s+for\s+(.+)$", re.I)
+_FORCE_WEB_SEARCH_RE = re.compile(r"^(?:search\s+(?:the\s+web|online|duckduckgo)\s+for\s+|google\s+)", re.I)
+
+
+def extract_site_search(transcript: str) -> Optional[tuple[str, str]]:
+    """"search youtube for lofi music" -> ("youtube", "lofi music") -- an explicit
+    site search, built as a URL in code (executor/act.py), never left to guess which
+    search box on the current page (if any) the user meant."""
+    m = _SITE_SEARCH_RE.match(transcript.strip())
+    return (m.group(1).lower(), m.group(2).strip()) if m else None
+
+
+def is_forced_web_search(transcript: str) -> bool:
+    """"search the web for X" / "search online for X" / "search duckduckgo for X" /
+    "google X" -- always an external web search, even when the current page has its
+    own search box that plain "search for X" would otherwise type into."""
+    return bool(_FORCE_WEB_SEARCH_RE.match(transcript.strip()))
 
 
 def extract_url(transcript: str) -> Optional[str]:

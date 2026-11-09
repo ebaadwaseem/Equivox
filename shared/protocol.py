@@ -39,6 +39,7 @@ class Element:
     is_video_link: bool = False
     suggestion_group: str = ""  # visible autocomplete popup owned by an input
     is_search_result: bool = False  # a result-title link on a search-results page (DDG/Google/generic)
+    input_name: Optional[str] = None  # the raw HTML name= attribute (e.g. "q") -- identifies a page's own search box
 
 
 @dataclass
@@ -95,3 +96,4 @@ class Decision:
     target_top_prob: float = 1.0       # probability of the picked target, for disambiguation
     repeat_count: int = 1
     target_probabilities: dict[str, float] = field(default_factory=dict)
+    search_site: Optional[str] = None  # "youtube"/"wikipedia"/"amazon" -- explicit site search (see backend/spans.py)
