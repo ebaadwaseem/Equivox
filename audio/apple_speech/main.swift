@@ -101,6 +101,7 @@ final class Listener {
     static let contextualStrings = [
         "Vox", "DuckDuckGo", "Wikipedia", "YouTube", "scroll", "click", "next field",
         "new tab", "close tab", "go back", "high contrast", "physiotherapy", "Edmonton",
+        "dropdown", "option one", "option two", "backspace", "Oilers",
     ]
     static let periodicRestartInterval: TimeInterval = 50.0  // avoid recognizer time limits
     static let endpointCheckInterval: TimeInterval = 0.1
@@ -183,11 +184,14 @@ final class Listener {
 
         let req = SFSpeechAudioBufferRecognitionRequest()
         req.shouldReportPartialResults = true
+        req.taskHint = .dictation
         if #available(macOS 13.0, *) {
             req.addsPunctuation = false
         }
         req.requiresOnDeviceRecognition = !allowServer
-        req.contextualStrings = Listener.contextualStrings
+        let extra = (ProcessInfo.processInfo.environment["VB_SPEECH_TERMS"] ?? "")
+            .split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        req.contextualStrings = Array((extra + Listener.contextualStrings).prefix(100))
         currentRequest = req
 
         currentTask = recognizer.recognitionTask(with: req) { [weak self] result, error in
@@ -325,7 +329,7 @@ requestMicAuth { micGranted in
             )
             exit(1)
         }
-        guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US")) else {
+        guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: ProcessInfo.processInfo.environment["VB_SPEECH_LOCALE"] ?? "en-US")) else {
             emitStatus("error", detail: "en-US speech recognizer is unavailable on this system.")
             exit(1)
         }

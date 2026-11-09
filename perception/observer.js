@@ -1,17 +1,18 @@
 // PERSON 2: injected into the page. Returns interactable elements with stable ids.
 () => {
   const SELECTOR = 'a[href], button, input, textarea, select, [role=button], [role=link], ' +
-                   '[role=tab], [role=menuitem], [role=checkbox], [role=radio], [role=textbox], [role=searchbox], [role=combobox], [role=listbox], [role=option], [onclick], [contenteditable]:not([contenteditable=false])';
+                   '[role=tab], [role=menuitem], [role=checkbox], [role=radio], [role=textbox], [role=searchbox], [role=combobox], [role=listbox], [role=option], [aria-label][tabindex], [onclick], [contenteditable]:not([contenteditable=false])';
   const ROLE_PRIORITY = ['textbox', 'checkbox', 'radio', 'button', 'select', 'tab', 'menuitem', 'link'];
   window.__vbNext = window.__vbNext || 1;
 
-  const clean = (s) => (s || '').trim().replace(/\s+/g, ' ').slice(0, 80);
+  const clean = (s) => (s || '').trim().replace(/\s+/g, ' ').slice(0, 140);
 
   function isVisible(el, style) {
     if (style.display === 'none' || style.visibility === 'hidden') return false;
     if (parseFloat(style.opacity) === 0) return false;
     if (el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
     if (el.getAttribute('aria-hidden') === 'true') return false;
+    if (el.closest('[aria-hidden="true"],[inert]')) return false;
     return true;
   }
 
@@ -44,6 +45,7 @@
       if (['submit', 'button', 'reset', 'image'].includes(type)) return 'button';
       return 'textbox';
     }
+    if (el.hasAttribute('tabindex') && el.getAttribute('aria-label')) return 'button';
     return tag;
   }
 
@@ -57,7 +59,9 @@
 
   function computeName(el, tag, type) {
     const ariaLabel = el.getAttribute('aria-label');
-    if (ariaLabel) return clean(ariaLabel);
+    if (ariaLabel && /[\p{L}\p{N}]/u.test(ariaLabel)) return clean(ariaLabel);
+    const tooltip = el.getAttribute('data-tooltip') || el.getAttribute('data-tooltip-content') || el.getAttribute('title');
+    if (tooltip) return clean(tooltip);
 
     const labelledby = el.getAttribute('aria-labelledby');
     if (labelledby) {
@@ -146,13 +150,50 @@
     return union > 0 ? inter / union : 0;
   }
 
+  // Autocomplete popups may be ARIA grids (Maps), not role=option lists.
+  // Follow the input's ownership rather than treating every table row as clickable.
+  const suggestionRows = new Map();
+  function collectSuggestions(root) {
+    const owners = [...root.querySelectorAll('[aria-controls], [aria-owns]')];
+    owners.sort((a, b) => Number(b === root.activeElement) - Number(a === root.activeElement));
+    const popups = [];
+    for (const owner of owners) {
+      if (!owner.matches('input, textarea, [role=combobox], [aria-autocomplete]')) continue;
+      for (const id of ((owner.getAttribute('aria-controls') || '') + ' ' + (owner.getAttribute('aria-owns') || '')).split(/\s+/)) {
+        const popup = root.getElementById(id);
+        if (popup && !popups.includes(popup)) popups.push(popup);
+      }
+    }
+    // Standalone listboxes also expose options when focus has moved to an option.
+    for (const popup of root.querySelectorAll('[role=listbox]')) {
+      if (!popups.includes(popup)) popups.push(popup);
+    }
+    for (const popup of popups) {
+      const r = popup.getBoundingClientRect();
+      if (!r.width || !r.height || !isVisible(popup, getComputedStyle(popup))) continue;
+      const rows = [...popup.querySelectorAll('[role=option], [role=row], [role=listitem]')]
+        .filter(row => !row.parentElement.closest('[role=option], [role=row], [role=listitem]') ||
+          !popup.contains(row.parentElement.closest('[role=option], [role=row], [role=listitem]')));
+      const visible = rows.filter(row => {
+        const box = row.getBoundingClientRect();
+        return box.width && box.height && box.bottom > 0 && box.top < innerHeight &&
+          isVisible(row, getComputedStyle(row)) && !isCovered(row, box);
+      });
+      if (!visible.length) continue;
+      if (!popup.dataset.vbId) popup.dataset.vbId = 'e' + String(window.__vbNext++).padStart(2, '0');
+      visible.forEach(row => suggestionRows.set(row, popup.dataset.vbId));
+      break; // only the active/first visible autocomplete popup gets numbering
+    }
+  }
+
   const accepted = []; // [{el, rect, data}]
   const hrefSeen = new Set(); // same-destination SIBLING links (not nested) also collapse to one:
                                // search-result tiles commonly wrap the title, a thumbnail, the
                                // URL text, and the snippet in separate <a> tags to the same href.
 
   function* candidates(root) {
-    yield* root.querySelectorAll(SELECTOR);
+    collectSuggestions(root);
+    yield* new Set([...root.querySelectorAll(SELECTOR), ...suggestionRows.keys()].filter(el => el.getRootNode() === root));
     for (const host of root.querySelectorAll('*')) {
       if (host.id !== 'vox-host' && host.shadowRoot) yield* candidates(host.shadowRoot);
     }
@@ -161,6 +202,11 @@
     // the overlay lives in a Shadow DOM so document.querySelectorAll can never actually
     // see inside it, but skip defensively in case that ever changes.
     if (el.id === 'vox-host' || (el.closest && el.closest('#vox-host'))) continue;
+    if ([...suggestionRows.keys()].some(row => row !== el && row.contains(el))) continue;
+    // A one-row listbox shares its box with the option. Keep the actionable row,
+    // not the popup container, when nested-box deduplication runs below.
+    if (el.matches('[role=listbox], [role=grid]') &&
+        [...suggestionRows.keys()].some(row => el !== row && el.contains(row))) continue;
     const r = el.getBoundingClientRect();
     if (r.width < 2 || r.height < 2) continue;
     const style = getComputedStyle(el);
@@ -169,7 +215,7 @@
 
     const tag = el.tagName.toLowerCase();
     const type = tag === 'input' ? (el.getAttribute('type') || 'text').toLowerCase() : null;
-    const role = roleOf(el, tag);
+    const role = suggestionRows.has(el) ? 'option' : roleOf(el, tag);
     const rect = { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) };
 
     if (role === 'link' && el.href) {
@@ -204,9 +250,17 @@
 
   function buildData(el, tag, type, role, rect, reuseId) {
     if (!el.dataset.vbId) el.dataset.vbId = reuseId || ('e' + String(window.__vbNext++).padStart(2, '0'));
-    const name = computeName(el, tag, type);
+    const labels = suggestionRows.has(el) ? [...el.querySelectorAll('[aria-label]')]
+      .filter(node => !node.closest('[aria-hidden=true]'))
+      .map(node => clean(node.getAttribute('aria-label'))).filter(Boolean) : [];
+    const name = el.getAttribute('aria-label') ? computeName(el, tag, type) : labels[0] || computeName(el, tag, type);
     return {
       id: el.dataset.vbId, role, name,
+      suggestion_group: suggestionRows.get(el) || '',
+      is_video_link: tag === 'a' && /\/(?:watch\?|shorts\/)/.test(el.href || ''),
+      description: clean(labels.slice(1).join(' ')) || clean((el.getAttribute('aria-describedby') || '').split(/\s+/)
+        .map(id => el.getRootNode().getElementById(id)?.textContent || '').join(' ')) ||
+        clean(el.closest('[role="article"]')?.innerText || ''),
       x: rect.x, y: rect.y, w: rect.w, h: rect.h,
       in_viewport: rect.y + rect.h > 0 && rect.y < innerHeight && rect.x + rect.w > 0 && rect.x < innerWidth,
       input_type: tag === 'select' ? 'select' : tag === 'textarea' ? 'textarea' : type,
@@ -214,8 +268,8 @@
       checked: (role === 'checkbox' || role === 'radio') ? !!el.checked : null,
       href_domain: role === 'link' ? hrefDomain(el) : null,
       is_homepage_link: role === 'link' ? isHomepageLink(el) : false,
-      active: el === document.activeElement,
-      options: tag === 'select' ? Array.from(el.options).filter(o => !o.disabled).slice(0, 100).map((o) => clean(o.text)) : [],
+      active: el === el.getRootNode().activeElement,
+      options: tag === 'select' ? Array.from(el.options).filter(o => !o.disabled && !o.parentElement.disabled).slice(0, 100).map((o) => clean(o.text)) : [],
       // semantic landmarks catch well-built pages; the class/id patterns catch the common
       // case of a plain <div class="header">/"navbar" with no real HTML5 semantics (e.g. DDG)
       in_chrome: !!el.closest(

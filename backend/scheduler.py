@@ -9,6 +9,7 @@ from collections import OrderedDict
 from typing import Awaitable, Callable
 
 from shared.protocol import Transcript
+from playwright.async_api import Error as PlaywrightError
 
 logger = logging.getLogger("scheduler")
 
@@ -54,6 +55,11 @@ class Scheduler:
     async def _run(self, t: Transcript) -> None:
         try:
             await self.handler(t)
+        except PlaywrightError as exc:
+            if type(exc).__name__ == "TargetClosedError":
+                logger.debug("decision stopped because its page closed")
+            else:
+                logger.exception("browser decision failed for %r", t.text)
         except Exception:
             logger.exception("decision failed for %r", t.text)
         finally:

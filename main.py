@@ -16,9 +16,13 @@ from playwright.async_api import async_playwright
 from audio.apple_transcriber import AppleSpeechTranscriber
 from audio.apple_transcriber import is_available as apple_speech_available
 from audio.transcriber import TypedTranscriber
-from backend import jev, policy, spans
+from audio.moonshine_transcriber import MoonshineTranscriber, is_available as moonshine_available
+from backend import jev, policy, spans, vision
+from backend.commands import ordinal_reply, shortcut, inspection_request, explicit_option
+from backend.choices import Choice, ChoiceSession, ranked_targets, page_suggestions
 from backend.context import ConversationContext, Turn
 from backend.clauses import first_clause
+from backend.forms import field_names
 from backend.model import decide
 from backend.scheduler import Scheduler
 from executor import act, undo
@@ -87,18 +91,7 @@ def _consumed_prefix(raw_text: str, current: str, act_now: Optional[str], is_fin
 def _parse_ordinal_reply(text: str, count: int) -> Optional[int]:
     """"2", "option 2", "the second one", "second" -> 2 (1-indexed), for replying to a
     numbered confirm/disambiguate prompt from either the terminal or the Vox panel."""
-    for w in (w.strip(".,!?") for w in text.strip().lower().split()):
-        if w.isdigit():
-            n = int(w)
-            if 1 <= n <= count:
-                return n
-        elif w in ORDINALS:
-            n = ORDINALS[w]
-            if n == -1:  # "last"
-                return count
-            if 1 <= n <= count:
-                return n
-    return None
+    return ordinal_reply(text, count)
 
 
 async def main() -> None:
@@ -124,7 +117,7 @@ async def main() -> None:
         last_scroll: Optional[Decision] = None  # for "keep scrolling"/"more"/"again"
         pending: dict | None = None  # {"kind": "confirm"|"disambiguate"|"undo_disambiguate", ...}
         listening_paused = False
-        apple_transcriber: Optional[AppleSpeechTranscriber] = None
+        apple_transcriber = None  # selected local speech adapter; both expose pause/resume
 
         context = ConversationContext()
         latest_raw: dict[int, str] = {}
@@ -153,6 +146,7 @@ async def main() -> None:
             they're skipped here. Never creates a checkpoint: popups are site-initiated
             by definition, which is exactly what checkpoints must NOT capture."""
             nonlocal active_page, page_epoch
+            watch_page(new_page)
             try:
                 opener = await new_page.opener()
             except Exception:
@@ -172,19 +166,21 @@ async def main() -> None:
 
         ctx.on("page", lambda p: asyncio.ensure_future(on_new_page(p)))
 
-        async def mark_user_command() -> None:
+        async def mark_user_command(page=None) -> None:
             nonlocal last_command_ts
             last_command_ts = time.time()
-            await undo.push_checkpoint(checkpoints, active_page)
+            await undo.push_checkpoint(checkpoints, page or active_page)
 
         async def run_action(d: Decision, target_name: str = "", turn: Optional[Turn] = None) -> None:
-            nonlocal active_page, last_scroll
+            nonlocal active_page, last_scroll, pending
+            action_page = active_page
+            await vox.set_options(action_page, [])
             action_started = time.perf_counter()
-            await mark_user_command()
+            await mark_user_command(action_page)
             try:
-                page_before = {"url": active_page.url, "title": await active_page.title()}
+                page_before = {"url": action_page.url, "title": await action_page.title()}
             except Exception:
-                page_before = {"url": active_page.url if active_page else "", "title": ""}
+                page_before = {"url": action_page.url if action_page else "", "title": ""}
             outcome = "done"
 
             try:
@@ -194,10 +190,10 @@ async def main() -> None:
                             active_page = await act.new_tab(ctx, d.text)
                             print("  ✓ opened new tab", active_page.url)
                         elif d.intent == "close_tab":
-                            active_page = await act.close_tab(ctx, active_page)
+                            active_page = await act.close_tab(ctx, action_page)
                             print("  ✓ closed tab, now on", active_page.url)
                         elif d.intent == "switch_tab":
-                            active_page = await act.switch_tab(ctx, active_page, d.text or "next")
+                            active_page = await act.switch_tab(ctx, action_page, d.text or "next")
                             print("  ✓ switched tab ->", active_page.url)
                         outcome = f"did {d.intent} {d.text or ''}".strip()
                         await vox.show_on(active_page)
@@ -206,13 +202,13 @@ async def main() -> None:
                         outcome = "failed"
                         print("  ✗", e)
                         await vox.set_then_idle_after(
-                            active_page, "error", vox.describe_failure(d.intent.replace("_", " ")), delay=ERROR_REVERT_S)
+                            active_page, "error", str(e) if isinstance(e, ValueError) else vox.describe_failure(d.intent.replace("_", " ")), delay=ERROR_REVERT_S)
                     return
 
                 if d.target_id:
-                    await highlight(active_page, d.target_id)
+                    await highlight(action_page, d.target_id)
                 try:
-                    result = await execute(active_page, d)
+                    result = await execute(action_page, d)
                     print("  ✓", result)
                     if result.startswith("no match"):
                         outcome = "failed"
@@ -230,6 +226,9 @@ async def main() -> None:
                             await vox.set_then_idle_after(active_page, "acting", result)
                         if d.scroll_to is None:
                             last_scroll = d
+                    elif result == "opened native dropdown":
+                        outcome = result
+                        await inspect_page("show options", "options", target_name)
                     else:
                         outcome = result
                         await vox.set_then_idle_after(active_page, "acting", vox.describe_action(d, target_name))
@@ -239,10 +238,10 @@ async def main() -> None:
                     await vox.set_then_idle_after(
                         active_page, "error", vox.describe_failure(d.intent.replace("_", " ")), delay=ERROR_REVERT_S)
             finally:
-                if active_page and d.intent not in TAB_INTENTS and active_page.url != page_before["url"]:
+                if action_page and d.intent not in TAB_INTENTS and action_page.url != page_before["url"]:
                     context.remember_page(page_before["url"], page_before["title"])
                     if outcome != "failed":
-                        outcome = f"navigated to {_short_url(active_page.url)}"
+                        outcome = f"navigated to {_short_url(action_page.url)}"
                 context.finish(turn, outcome)
                 logger.info("action=%s outcome=%s action_ms=%.0f", d.intent, outcome,
                             (time.perf_counter() - action_started) * 1000)
@@ -254,7 +253,14 @@ async def main() -> None:
             action_wake.set()
 
         def submit_action(d: Decision, target_name: str, turn: Optional[Turn] = None) -> None:
-            submit_call(lambda: run_action(d, target_name, turn))
+            expected_page = active_page
+            async def run_reserved():
+                if active_page is not expected_page:
+                    context.finish(turn, "failed: active tab changed")
+                    await vox.set(active_page, "unsure", "The active tab changed. Please repeat the command.")
+                    return
+                await run_action(d, target_name, turn)
+            submit_call(run_reserved)
 
         async def action_worker() -> None:
             nonlocal action_busy
@@ -276,6 +282,54 @@ async def main() -> None:
                 buffered_transcripts.clear()
                 for t in buffered:
                     sched.submit(latest_transcripts.get(t.id, t), force=True)
+
+        async def inspect_page(goal, mode, said):
+            nonlocal pending
+            page = active_page
+            await vox.set(page, "thinking", said)
+            state = await get_page_state(page, with_screenshot=bool(os.getenv("VB_VLM_MODEL")))
+            viewport = await page.evaluate("() => [innerWidth,innerHeight]")
+            revision = await vision.scene_revision(page)
+            suggestions = page_suggestions(state.elements)
+            focused_select = next((e for e in state.elements if e.active and e.role == "select" and e.options), None)
+            result = None if (suggestions or focused_select) and mode == "options" else await vision.observe(state, goal, viewport, context=context.encode())
+            if page is not active_page or page.url != state.url:
+                return
+            if result is not None and await vision.scene_revision(page) != revision:
+                await vox.set(page, "unsure", "The page changed while I was looking. Say show options again.")
+                return
+            visible = [e for e in shortlist(state, goal, limit=100) if e.in_viewport and e.name.strip() and e.role in {"button", "link", "option", "select", "textbox", "checkbox", "radio", "tab", "menuitem"}]
+            visible.sort(key=lambda e: (not e.active, e.in_chrome or e.is_homepage_link))
+            choices = result["choices"] if result is not None else [
+                Choice(e.name, Decision(True, "click", target_id=e.id), detail=e.description or e.role, element=e) for e in visible[:8]]
+            if suggestions and mode == "options":
+                choices = [Choice(e.name, Decision(True, "click", target_id=e.id),
+                                  detail=e.description, element=e) for e in suggestions]
+            if mode == "options" and focused_select:
+                choices = [Choice(label, Decision(True, "select", target_id=focused_select.id, text=label),
+                                  detail=focused_select.name, element=focused_select) for label in focused_select.options[:30]]
+            if result is not None:
+                description = result["description"]
+                if result["plan"]:
+                    description += "\nSuggested steps: " + " ".join(f"{i+1}. {step}" for i,step in enumerate(result["plan"]))
+            else:
+                description = f"From page text: {state.title or 'Current page'}. {state.summary}"
+                if os.getenv("VB_VLM_MODEL"):
+                    description += " The visual model was unavailable."
+                if mode != "options":
+                    description += " Available controls: " + ", ".join(e.name for e in visible[:6]) + "."
+                    if mode == "plan":
+                        description += " Visual planning needs VB_VLM_MODEL. You can choose one of the visible controls below."
+            if not choices:
+                pending = None
+                await vox.set_options(page, [])
+                await vox.set(page, "acting", description.strip() or "No labelled controls are visible. Configure VB_VLM_MODEL to inspect the screenshot.")
+                return
+            session = ChoiceSession(page, page.url, choices, revision=revision if any(c.point for c in choices) else None,
+                                    screenshot=state.screenshot_b64 if any(c.point for c in choices) else None)
+            pending = {"kind": "choices", "session": session, "said": said, "page": page, "url": page.url}
+            await vox.set(page, "unsure", description.strip() if mode != "options" else "Choose a visible control. Say click option one.")
+            await vox.set_options(page, session.rows())
 
         async def go_back_to(index: int) -> None:
             nonlocal active_page
@@ -317,12 +371,9 @@ async def main() -> None:
             print("  ❓ Which one did you mean?")
             for i, cand_idx in enumerate(candidates, 1):
                 print(f"     {i}) {undo.describe_candidate(checkpoints, cand_idx, active_page)}")
-            options = "   ".join(
-                f"{i} · {undo.describe_candidate(checkpoints, cand_idx, active_page)}"
-                for i, cand_idx in enumerate(candidates, 1)
-            )
-            await vox.set(active_page, "unsure", f"Did you mean: {options}")
-            pending = {"kind": "undo_disambiguate", "candidates": candidates}
+            await vox.set(active_page, "unsure", "Which page? Say click option one or click option two.")
+            await vox.set_options(active_page, [dict(label=undo.describe_candidate(checkpoints, idx, active_page)) for idx in candidates])
+            pending = {"kind": "undo_disambiguate", "candidates": candidates, "page": active_page, "url": active_page.url}
 
         def schedule_silence(t: Transcript, raw_text: str, retry_in_ms: int, utterance_id: Optional[int]) -> None:
             nonlocal silence_task
@@ -377,7 +428,12 @@ async def main() -> None:
                     )
 
             remainder = t.text
-            clause, clause_end, bounded = first_clause(remainder)
+            form_state = None
+            field_labels = []
+            if not action_busy and not action_queue and (sliced or re.match(r"^(?:fill|set)\b", remainder, re.I)):
+                form_state = await get_page_state(active_page)
+                field_labels = [label for e in getattr(form_state, "elements", []) if e.role == "textbox" for label in field_names(e)]
+            clause, clause_end, bounded = first_clause(remainder, field_labels)
             offset = len(" ".join(raw_text.split())) - len(remainder)
             prefix = " ".join(raw_text.split())[:offset + clause_end]
             t = Transcript(clause, t.is_final, t.confidence, physical_id, t.silent_ms)
@@ -415,6 +471,7 @@ async def main() -> None:
                 print("  ✓ paused listening")
                 await vox.set(active_page, "idle", "Paused")
                 pending = None
+                await vox.set_options(active_page, [])
                 return
             if text_norm in RESUME_LISTENING_PHRASES or (
                 text_norm in TOGGLE_LISTENING_PHRASES and listening_paused
@@ -424,17 +481,135 @@ async def main() -> None:
                 listening_paused = False
                 print("  ✓ resumed listening")
                 await vox.set(active_page, "idle")
+                await vox.set_options(active_page, [])
                 pending = None
                 return
             if vox.is_hide_command(t.text):
                 await vox.hide(active_page)
                 print("  ✓ hid Vox")
+                await vox.set_options(active_page, [])
                 pending = None
                 return
             if vox.is_show_command(t.text):
                 await vox.show(active_page)
                 print("  ✓ showed Vox")
+                await vox.set_options(active_page, [])
                 pending = None
+                return
+
+            # A webpage's open autocomplete owns "click option N", even when an
+            # earlier disambiguation question listed unrelated page controls.
+            if explicit_option(t.text):
+                fresh = await get_page_state(active_page)
+                suggestions = page_suggestions(getattr(fresh, "elements", []))
+                if suggestions:
+                    choices = [Choice(e.name, Decision(True, "click", target_id=e.id),
+                                      detail=e.description, element=e) for e in suggestions]
+                    session = ChoiceSession(active_page, active_page.url, choices)
+                    pending = {"kind": "choices", "session": session, "said": t.text,
+                               "page": active_page, "url": active_page.url}
+                    await vox.set_options(active_page, session.rows())
+
+            # Options stay bound to their original page and survive ASR finalization
+            # of the command that produced them. Spoken numbers never go through Jev.
+            if pending and pending["kind"] in {"choices", "disambiguate", "undo_disambiguate"}:
+                if pending.get("page", active_page) is not active_page or pending.get("url", active_page.url) != active_page.url:
+                    pending = None
+                    await vox.set_options(active_page, [])
+                    await vox.set(active_page, "unsure", "Those options belong to the previous page. Say show options.")
+                    return
+                count = len(pending["session"].choices) if pending["kind"] == "choices" else len(pending["candidates"])
+                number = ordinal_reply(t.text, count)
+                if number is not None and not (t.is_final or bounded or quiet_ms(physical_id) >= policy.PAYLOAD_SILENCE_MS):
+                    schedule_silence(t, raw_text, max(50, int(policy.PAYLOAD_SILENCE_MS - quiet_ms(physical_id))), physical_id)
+                    return
+                if number is None and not explicit_option(t.text) and not t.is_final and not bounded:
+                    # A noisy intermediate hypothesis is not a reason to discard
+                    # the question before the recognizer finishes "option two".
+                    return
+                if pending["kind"] == "choices":
+                    session = pending["session"]
+                    n = ordinal_reply(t.text, len(session.choices))
+                    if n is not None:
+                        revision = await vision.scene_revision(active_page) if session.revision is not None else None
+                        if not session.valid(active_page, revision):
+                            pending = None
+                            await vox.set_options(active_page, [])
+                            await vox.set(active_page, "unsure", "The page changed. Say show options again.")
+                            return
+                        choice = session.choices[n-1]
+                        if choice.element:
+                            fresh = await get_page_state(active_page)
+                            current = next((e for e in fresh.elements if e.id == choice.element.id), None)
+                            if (current is None or current.name != choice.element.name or
+                                not session.valid(active_page, revision) or
+                                (choice.decision.intent == "select" and current.options and choice.decision.text not in current.options)):
+                                pending = None
+                                await vox.set_options(active_page, [])
+                                await vox.set(active_page, "unsure", "That control changed. Say show options again.")
+                                return
+                        pending = None
+                        await vox.set_options(active_page, [])
+                        if policy.looks_destructive(choice.label):
+                            pending = {"kind":"confirm", "decision":choice.decision, "target_name":choice.label,
+                                       "said":t.text, "physical_id":physical_id, "prefix":prefix,
+                                       "page":active_page, "url":active_page.url}
+                            context.consume(physical_id, prefix)
+                            await vox.set(active_page, "unsure", f"{choice.label}? Say yes or no.")
+                            return
+                        turn = context.commit(t.text, choice.decision, choice.label)
+                        consume_and_continue()
+                        if choice.point:
+                            async def visual_click():
+                                page = session.page
+                                if not session.valid(active_page, await vision.scene_revision(page)):
+                                    context.finish(turn, "failed: page changed")
+                                    await vox.set(active_page, "unsure", "The page changed. Say show options again.")
+                                    return
+                                fresh = await get_page_state(page, with_screenshot=True)
+                                if fresh.screenshot_b64 != session.screenshot or active_page is not page:
+                                    context.finish(turn, "failed: screenshot changed")
+                                    await vox.set(active_page, "unsure", "The visible map changed. Say show map options again.")
+                                    return
+                                await mark_user_command(page)
+                                outcome = await act.click_visual(page, choice.point)
+                                context.finish(turn, outcome)
+                                await vox.set_then_idle_after(active_page, "acting", outcome)
+                            submit_call(visual_click)
+                        else:
+                            submit_action(choice.decision, choice.label, turn)
+                        return
+                    if explicit_option(t.text):
+                        await vox.set(active_page, "unsure", f"Choose an option from 1 to {len(session.choices)}.")
+                        return
+                count = len(pending.get("candidates", []))
+                if explicit_option(t.text) and ordinal_reply(t.text, count) is None:
+                    await vox.set(active_page, "unsure", f"Choose an option from 1 to {count}.")
+                    return
+
+            if explicit_option(t.text) and pending is None:
+                await vox.set_options(active_page, [])
+                await vox.set(active_page, "unsure", "There are no options yet. Say show options.")
+                return
+
+            if mode := inspection_request(t.text):
+                if not (t.is_final or bounded or quiet_ms(physical_id) >= 350):
+                    schedule_silence(t, raw_text, 350, physical_id)
+                    return
+                consume_and_continue()
+                pending = None
+                await vox.set_options(active_page, [])
+                submit_call(lambda: inspect_page(t.text, mode, raw_text))
+                return
+
+            if quick := shortcut(t.text):
+                if not (t.is_final or bounded or quiet_ms(physical_id) >= 200):
+                    schedule_silence(t, raw_text, 200, physical_id)
+                    return
+                pending = None
+                turn = context.commit(t.text, quick)
+                consume_and_continue()
+                submit_action(quick, "", turn)
                 return
 
             # explicit phrases skip inference entirely
@@ -481,6 +656,10 @@ async def main() -> None:
                 return
 
             if pending and pending["kind"] == "confirm":
+                if pending.get("page", active_page) is not active_page or pending.get("url", active_page.url) != active_page.url:
+                    pending = None
+                    await vox.set(active_page, "unsure", "The tab changed. Please repeat the action you wanted.")
+                    return
                 if text_norm in AFFIRM:
                     d = pending["decision"]
                     said = pending.get("said", t.text)
@@ -510,6 +689,13 @@ async def main() -> None:
                     d = pending["decision"]
                     d.target_id = candidates[n - 1].id
                     d.ambiguous = False
+                    d.destructive = d.destructive or policy.looks_destructive(candidates[n - 1].name)
+                    await vox.set_options(active_page, [])
+                    if d.destructive:
+                        pending = dict(pending, kind="confirm", decision=d, target_name=candidates[n-1].name)
+                        context.consume(physical_id, prefix)
+                        await vox.set(active_page, "unsure", f"{candidates[n-1].name}? Say yes or no.")
+                        return
                     said = pending.get("said", t.text)
                     turn = context.commit(said, d, candidates[n - 1].name)
                     confirmed_id = pending.get("physical_id")
@@ -520,7 +706,10 @@ async def main() -> None:
                     pending = None
                     submit_action(d, candidates[n - 1].name, turn)
                     return
-                pending = None  # fall through and treat this as a new command
+                if not t.is_final and not bounded:
+                    return
+                pending = None  # a complete new command replaces the question
+                await vox.set_options(active_page, [])
 
             if pending and pending["kind"] == "undo_disambiguate":
                 candidates = pending["candidates"]
@@ -528,7 +717,9 @@ async def main() -> None:
                 if n is not None:
                     d = Decision(True, "back")
                     turn = context.commit(t.text, d, "undo")
+                    consume_and_continue()
                     pending = None
+                    await vox.set_options(active_page, [])
 
                     async def undo_choice() -> None:
                         try:
@@ -539,7 +730,10 @@ async def main() -> None:
 
                     submit_call(undo_choice)
                     return
-                pending = None  # fall through and treat this as a new command
+                if not t.is_final and not bounded:
+                    return
+                pending = None  # a complete new command replaces the question
+                await vox.set_options(active_page, [])
 
             # Only switch to "thinking" once the utterance is final, and keep its words
             # on screen -- doing this per partial made the panel strobe between
@@ -550,7 +744,7 @@ async def main() -> None:
             if os.getenv("VB_VISION") == "1":
                 state = await get_page_state(request_page, with_screenshot=True)
             else:
-                state = await get_page_state(request_page)
+                state = form_state or await get_page_state(request_page)
             cands = shortlist(state, t.text)
             viewport = request_page.viewport_size
             vp = (viewport["width"], viewport["height"]) if viewport else None
@@ -570,7 +764,7 @@ async def main() -> None:
                 d = cached[1]
             else:
                 d = await decide(
-                    t.text, t.is_final, prompt_text, cands,
+                    t.text, t.is_final or bounded, prompt_text, cands,
                     page=page_info, context=context,
                     pending_confirmation=pending_confirmation, silent_ms=t.silent_ms,
                 )
@@ -600,7 +794,7 @@ async def main() -> None:
                 latest_current, _ = context.slice(physical_id, latest)
                 # A later clause may arrive during inference. A bounded first
                 # clause is unchanged and safe to commit; a revised payload isn't.
-                latest_clause = first_clause(latest_current)[0] if latest_current else None
+                latest_clause = first_clause(latest_current, field_labels)[0] if latest_current else None
                 stale = latest_clause != t.text
                 if stale:
                     return
@@ -637,10 +831,17 @@ async def main() -> None:
                     "kind": "confirm", "decision": d, "target_name": target_name,
                     "said": t.text, "physical_id": physical_id,
                     "prefix": _executed_prefix(t, d),
+                    "page": active_page, "url": active_page.url,
                 }
+                context.consume(physical_id, prefix)
                 return
             if outcome == "DISAMBIGUATE":
-                top = cands[:3]
+                suggestions = page_suggestions(getattr(state, "elements", [])) if d.intent == "click" else []
+                if not suggestions and act.is_map_url(active_page.url) and os.getenv("VB_VLM_MODEL"):
+                    consume_and_continue()
+                    submit_call(lambda: inspect_page(t.text, "options", raw_text))
+                    return
+                top = suggestions or ranked_targets(d, cands)
                 if not top:
                     print("  ✗ no matching element on this page")
                     await vox.set_then_idle_after(
@@ -649,15 +850,20 @@ async def main() -> None:
                 print("  ❓ Which one did you mean?")
                 for i, e in enumerate(top, 1):
                     print(f'     {i}) {e.role} "{e.name}"')
-                options = "   ".join(f"{i} · {e.name}" for i, e in enumerate(top, 1))
-                await vox.set(active_page, "unsure", f"Did you mean: {options}")
+                await vox.set(active_page, "unsure", "Which control? Say click option one or click option two.")
+                await vox.set_options(active_page, [dict(label=e.name or e.role, detail=e.description or e.role) for e in top])
                 pending = {
                     "kind": "disambiguate", "decision": d, "candidates": top,
                     "said": t.text, "physical_id": physical_id,
-                    "prefix": _executed_prefix(t, d),
+                    "prefix": _executed_prefix(t, d), "page": active_page, "url": active_page.url,
                 }
+                # This clause now lives in the pending question, not in the next
+                # transcript slice. The recognizer may append the spoken reply
+                # to this same physical utterance instead of producing a new id.
+                context.consume(physical_id, prefix)
                 return
             if outcome == "COMMIT":
+                await vox.set_options(active_page, [])
                 pending = None  # a fresh command supersedes any confirmation still open
                 turn = context.commit(t.text, d, target_name)
                 consume_and_continue()
@@ -670,6 +876,26 @@ async def main() -> None:
         # consumer loop below drains the queue into the scheduler.
         input_queue: asyncio.Queue[Transcript] = asyncio.Queue()
 
+        def watch_page(page):
+            if not hasattr(page, "on") or getattr(page, "_vox_close_watched", False):
+                return
+            page._vox_close_watched = True
+            def closed(*args):
+                nonlocal active_page, page_epoch, pending
+                remaining = [p for p in ctx.pages if not p.is_closed()]
+                if not remaining:
+                    input_queue.put_nowait(None)
+                elif page is active_page:
+                    active_page = remaining[-1]
+                    page_epoch += 1
+                    pending = None
+                    asyncio.create_task(vox.show_on(active_page))
+            page.on("close", closed)
+
+        if hasattr(browser, "on"):
+            browser.on("disconnected", lambda *args: input_queue.put_nowait(None))
+        ctx.on("close", lambda *args: input_queue.put_nowait(None))
+
         def on_vox_command(source, text: str) -> None:
             # must return immediately -- just enqueue, never await anything slow here.
             text = (text or "").strip()
@@ -679,6 +905,15 @@ async def main() -> None:
         # expose_binding is registered on the CONTEXT (not a page), so it applies to
         # every current/future tab and survives navigation with no per-page plumbing.
         await ctx.expose_binding("voxCommand", on_vox_command)
+        async def on_vox_active(source) -> None:
+            nonlocal active_page, page_epoch
+            page = source.get("page")
+            if (page is not None and page is not active_page and not page.is_closed()
+                    and await page.evaluate("() => document.visibilityState === 'visible'")):
+                active_page = page
+                page_epoch += 1
+                await vox.show_on(page)
+        await ctx.expose_binding("voxActiveTab", on_vox_active)
         # install the overlay's init-script BEFORE creating/navigating the first page --
         # add_init_script only affects pages/navigations registered after this point, so
         # doing this after the initial page.goto() would miss the first page entirely.
@@ -689,6 +924,8 @@ async def main() -> None:
         else:
             active_page = await ctx.new_page()
             await active_page.goto(START_URL)
+        for page in getattr(ctx, "pages", [active_page]):
+            watch_page(page)
 
         async def feed_terminal() -> None:
             async for t in TypedTranscriber().stream():
@@ -700,9 +937,11 @@ async def main() -> None:
         # the Swift listener binary has been built, else falls back to typed-only. The
         # terminal (and the Vox panel's typed-command box, via voxCommand above) stay
         # active regardless -- they're the fallback this whole thing must not break.
-        transcriber_choice = os.getenv("VB_TRANSCRIBER", "apple" if apple_speech_available() else "typed")
-        if transcriber_choice == "apple":
-            if not apple_speech_available():
+        transcriber_choice = os.getenv("VB_TRANSCRIBER", "auto")
+        if transcriber_choice == "auto":
+            transcriber_choice = "moonshine" if moonshine_available() else "apple" if apple_speech_available() else "typed"
+        if transcriber_choice in {"apple", "moonshine"}:
+            if transcriber_choice == "apple" and not apple_speech_available():
                 print("  ⚠ VB_TRANSCRIBER=apple but bin/vox-listen is missing -- run scripts/build_listener.sh. "
                       "Falling back to typed input only.")
             else:
@@ -716,10 +955,14 @@ async def main() -> None:
                     if kind == "error":
                         logger.warning("voice listener: %s", detail)
                         print("  ⚠ voice listener:", detail)
+                        await vox.set(active_page, "error", detail)
+                    elif kind == "loading":
+                        await vox.set(active_page, "idle", detail)
                     else:
                         logger.info("voice listener status: %s %s", kind, detail)
 
-                apple_transcriber = AppleSpeechTranscriber(on_level=on_mic_level, on_status=on_mic_status)
+                adapter = MoonshineTranscriber if transcriber_choice == "moonshine" else AppleSpeechTranscriber
+                apple_transcriber = adapter(on_level=on_mic_level, on_status=on_mic_status)
 
                 async def feed_apple() -> None:
                     async for t in apple_transcriber.stream():
@@ -732,6 +975,14 @@ async def main() -> None:
         try:
             while True:
                 t = await input_queue.get()
+                if t is None:
+                    break
+                if getattr(active_page, "is_closed", lambda: False)():
+                    remaining = [p for p in ctx.pages if not p.is_closed()]
+                    if not remaining:
+                        break
+                    active_page = remaining[-1]
+                    page_epoch += 1
                 if t.id is None:
                     input_serial -= 1
                     t.id = input_serial
@@ -770,7 +1021,12 @@ async def main() -> None:
             await sched.aclose()
             await asyncio.gather(*tasks, return_exceptions=True)
             await jev.aclose()
+            if not cdp and hasattr(browser, "close"):
+                await browser.close()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

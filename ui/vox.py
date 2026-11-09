@@ -9,6 +9,7 @@ which page is "active" (new tab / tab switch). Never raises -- a missing overlay
 import asyncio
 import logging
 import re
+import time
 import weakref
 from pathlib import Path
 
@@ -55,6 +56,20 @@ _minimized = False
 _version = 0
 _wired_pages = weakref.WeakSet()
 _history: list[dict] = []
+_options: list[dict] = []
+_options_page = None
+_last_message = ""
+_last_message_at = 0.0
+_visible_page = None
+HINT_COOLDOWN_S = 30.0
+
+
+async def set_options(page: Page, rows) -> None:
+    global _options, _options_page
+    _options = list(rows)
+    _options_page = page
+    await _wire(page)
+    await _apply(page)
 
 
 async def set_history(page: Page, turns, context_turns) -> None:
@@ -80,11 +95,24 @@ async def install(context) -> None:
 
 async def set(page: Page, state: str, text: str = "") -> None:
     """Update the overlay's visible state/text on `page`."""
-    global _current, _version
+    global _current, _version, _last_message, _last_message_at, _visible_page
+    _visible_page = weakref.ref(page)
+    if text and state in {"listening", "thinking"}:
+        _last_message, _last_message_at = text, time.monotonic()
+    if state == "idle" and not text and time.monotonic() - _last_message_at < HINT_COOLDOWN_S:
+        text = _last_message
     _current = (state, text)
     _version += 1
     await _wire(page)
     await _apply(page)
+    if state == "idle" and _last_message and text == _last_message:
+        version = _version
+        async def cooldown():
+            await asyncio.sleep(max(0, HINT_COOLDOWN_S - (time.monotonic() - _last_message_at)))
+            if _version == version:
+                target = _visible_page() if _visible_page else None
+                await set(target or page, "idle")
+        asyncio.create_task(cooldown())
 
 
 async def set_then_idle_after(page: Page, state: str, text: str, delay: float = 1.5) -> None:
@@ -130,6 +158,8 @@ async def show_on(page: Page) -> None:
     """Call after switching the active tab (new_tab/switch_tab/close_tab/undo) so the
     overlay on the newly-active page reflects whatever state (and minimized flag) is
     already current, and bring_to_front()s it so the browser UI actually switches tabs."""
+    global _visible_page
+    _visible_page = weakref.ref(page)
     try:
         await page.bring_to_front()
     except Exception as e:
@@ -172,6 +202,16 @@ def describe_action(d: Decision, target_name: str) -> str:
         return "Closing this tab"
     if d.intent == "switch_tab":
         return "Switching tabs"
+    if d.intent == "reload":
+        return "Reloading the tab"
+    if d.intent == "clear":
+        return "Clearing the text field"
+    if d.intent == "key":
+        return f"Pressing {d.text}"
+    if d.intent == "route":
+        return f"Directions to {d.text}"
+    if d.intent == "map_move":
+        return f"Moving the map {d.text}"
     if d.intent == "accessibility":
         return {
             "zoom_in": "Making text bigger", "zoom_out": "Making text smaller",
@@ -200,9 +240,10 @@ async def _apply(page: Page) -> None:
     state, text = _current
     try:
         await page.evaluate(
-            "([s, t, m, h]) => { if (window.__vox) { window.__vox.set(s, t, undefined, m); "
-            "if (window.__vox.setHistory) window.__vox.setHistory(h); } }",
-            [state, text, _minimized, _history],
+            "([s, t, m, h, o]) => { if (window.__vox) { window.__vox.set(s, t, undefined, m); "
+            "if (window.__vox.setHistory) window.__vox.setHistory(h); "
+            "if (window.__vox.setOptions) window.__vox.setOptions(o); } }",
+            [state, text, _minimized, _history, _options if page is _options_page else []],
         )
     except Exception as e:
         logger.debug("overlay apply skipped: %s", e)

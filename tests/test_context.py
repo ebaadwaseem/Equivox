@@ -77,3 +77,18 @@ def test_successive_clauses_consume_only_the_executed_remainder():
     ctx.consume(1, "search for pizza, and scroll down")
     assert ctx.active_prefix == "search for pizza, and scroll down"
     assert ctx.slice(1, "search for pizza, and scroll down, then click menu") == ("click menu", "1+2")
+
+
+def test_number_words_revised_to_digits_do_not_drop_followup_commands():
+    ctx=ConversationContext()
+    ctx.consume(1,'click option one')
+    assert ctx.slice(1,'click option 1 then scroll down')[0]=='scroll down'
+
+
+def test_confirmation_cannot_unconsume_an_already_spoken_choice_reply():
+    ctx=ConversationContext()
+    ctx.consume(1,'click the button click option two')
+    generation=ctx.generation(1)
+    ctx.consume(1,'click the button')
+    assert ctx.generation(1)==generation
+    assert ctx.slice(1,'click the button click option 2 then scroll down')[0]=='scroll down'

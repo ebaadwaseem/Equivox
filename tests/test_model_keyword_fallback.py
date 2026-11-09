@@ -180,3 +180,8 @@ def test_type_with_accessibility_keyword_still_types(monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     d = _run("type increase in the name field", _elements())
     assert d.is_command and d.intent == "type" and d.text == "increase"
+
+
+def test_unaddressed_transcription_fragment_does_not_click_a_matching_label(monkeypatch):
+    monkeypatch.delenv('OPENROUTER_API_KEY',raising=False)
+    assert not _run('Key',[Element('e1','link','Key resources')]).is_command

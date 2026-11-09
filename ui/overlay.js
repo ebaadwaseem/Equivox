@@ -12,7 +12,7 @@
   window.__voxMounting = true;
 
   const STATES = {
-    idle:      ["Idle",          'Say "search for physio clinics" — or click to type'],
+    idle:      ["Idle",          'Say a browser command'],
     listening: ["Listening…",    ""],
     thinking:  ["Thinking…",     ""],
     acting:    ["Done",          ""],
@@ -47,6 +47,12 @@
     document.body.appendChild(host);
 
     const shadow = host.attachShadow({ mode: "open" });
+    const reportActive = () => {
+      if (document.visibilityState === "visible" && window.voxActiveTab) window.voxActiveTab().catch(() => {});
+    };
+    document.addEventListener("visibilitychange", reportActive);
+    window.addEventListener("focus", reportActive);
+    reportActive();
 
     const style = document.createElement("style");
     style.textContent = `
@@ -164,6 +170,15 @@
       .panel .hide { position: absolute; top: 8px; right: 10px; width: 26px; height: 26px; border-radius: 50%;
         border: 1px solid rgba(255,255,255,.7); background: rgba(255,255,255,.4); color: #0b2540;
         font-size: 16px; line-height: 1; cursor: pointer; pointer-events: auto; z-index: 2; }
+      .choices { margin-top: 12px; pointer-events: auto; }
+      .choices[hidden] { display: none; }
+      .choices-help { font: 13px/1.4 system-ui; color: #245268; margin-bottom: 8px; }
+      .choices ol { margin: 0; padding: 0; list-style: none; max-height: min(36vh, 300px); overflow-y: auto; overscroll-behavior: contain; }
+      .choices li { margin: 6px 0; }
+      .choices button { display: grid; grid-template-columns: 28px 1fr; gap: 9px; width: 100%; padding: 10px; border: 1px solid #8dbac9; border-radius: 8px; background: rgba(255,255,255,.8); text-align: left; color: #102e40; font: 16px/1.4 system-ui; cursor: pointer; }
+      .choices button:focus-visible { outline: 3px solid #167da5; }
+      .choice-number { font-weight: 750; color: #08627f; }
+      .choice-detail { display: block; font-size: 12px; color: #45677b; margin-top: 3px; }
       .activity { pointer-events: none; font: 13px/1.45 system-ui; color: #173c54; margin-top: 10px; }
       .activity[open] { pointer-events: auto; }
       .activity summary { pointer-events: auto; width: fit-content; cursor: pointer; padding: 4px 0; }
@@ -222,6 +237,10 @@
         <button class="hide" id="hide" aria-label="Hide Vox" title="Hide (or say 'hide Vox')">–</button>
         <div class="label" id="label">Idle</div>
         <div class="text" id="text"><span id="text-inner"></span></div>
+        <section class="choices" id="choices" aria-label="Available options" hidden>
+          <div class="choices-help">Say “click option one” or “click option two”</div>
+          <ol id="choices-list"></ol>
+        </section>
         <details class="activity" id="activity">
           <summary>Recent speech &amp; actions <span id="activity-count"></span></summary>
           <div class="history-key">Highlighted rows are included in decision context</div>
@@ -641,7 +660,42 @@
       shadow.getElementById("activity-count").textContent = rows.length ? `(${rows.length})` : "";
       if (atBottom) list.scrollTop = list.scrollHeight;
     }
-    window.__vox = { set: setVoxState, setLevel, setHistory };
+    let optionsSignature = "";
+    function setOptions(rows) {
+      const signature = JSON.stringify(rows);
+      if (signature === optionsSignature) return;
+      optionsSignature = signature;
+      const area = shadow.getElementById("choices");
+      const list = shadow.getElementById("choices-list");
+      list.replaceChildren();
+      area.hidden = !rows.length;
+      for (const [i, row] of rows.entries()) {
+        const li = document.createElement("li");
+        const button = document.createElement("button");
+        button.type = "button";
+        button.setAttribute("aria-label", `Click option ${i+1}: ${row.label}`);
+        const number = document.createElement("span");
+        number.className = "choice-number";
+        number.textContent = `${i+1}`;
+        const label = document.createElement("span");
+        label.textContent = row.label;
+        if (row.detail) {
+          const detail = document.createElement("small");
+          detail.className = "choice-detail";
+          detail.textContent = row.detail;
+          label.append(detail);
+        }
+        button.append(number, label);
+        button.addEventListener("click", () => sendCommand(`click option ${i+1}`));
+        li.append(button);
+        list.append(li);
+      }
+      if (rows.length) {
+        restore();
+        srLiveEl.textContent = rows.map((r,i)=>`Option ${i+1}: ${r.label}`).join('. ') + '. Say click option one.';
+      }
+    }
+    window.__vox = { set: setVoxState, setLevel, setHistory, setOptions };
     setVoxState("idle");
   }
 

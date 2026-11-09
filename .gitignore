@@ -6,3 +6,5 @@ __pycache__/
 .playwright-mcp/
 spike-log.jsonl
 bin/
+
+.cache/

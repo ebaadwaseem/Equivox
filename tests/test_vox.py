@@ -89,3 +89,23 @@ def test_describe_failure_includes_action_and_suggestion():
     msg = describe_failure("click that")
     assert "click that" in msg
     assert "differently" in msg.lower()
+
+
+def test_idle_hint_returns_only_after_the_cooldown(monkeypatch):
+    import asyncio
+    from ui import vox
+    class Page:
+        pass
+    async def noop(*args,**kwargs):
+        pass
+    async def run():
+        monkeypatch.setattr(vox,'_wire',noop)
+        monkeypatch.setattr(vox,'_apply',noop)
+        monkeypatch.setattr(vox,'HINT_COOLDOWN_S',.03)
+        page=Page()
+        await vox.set(page,'listening','reload tab')
+        await vox.set(page,'idle')
+        assert vox._current==('idle','reload tab')
+        await asyncio.sleep(.05)
+        assert vox._current==('idle','')
+    asyncio.run(run())

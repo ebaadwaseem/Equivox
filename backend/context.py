@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from shared.protocol import Decision
+from backend.commands import NUMBERS, ORDINALS
 
 MAX_TURNS = 12
 
@@ -64,7 +65,13 @@ class ConversationContext:
     def consume(self, utterance_id: Optional[int], said: str) -> None:
         if utterance_id is None:
             return
-        self.active_prefix = " ".join(said.split()).lower()
+        prefix = " ".join(said.split()).lower()
+        existing, _ = self._consumed.get(utterance_id, ("", 0))
+        # Resolving a question may refer back to its original clause. Do not
+        # un-consume a longer reply that has already arrived in the same breath.
+        if existing and self._starts_with_prefix(existing, prefix):
+            return
+        self.active_prefix = prefix
         self.consumed_id = utterance_id
         self.consumed_gen = self.generation(utterance_id) + 1
         self._consumed[utterance_id] = (self.active_prefix, self.consumed_gen)
@@ -87,7 +94,7 @@ class ConversationContext:
             return None, utterance_id
         remainder = normalized[end:].lstrip(" ,;.!?-")
         remainder = re.sub(r"^(?:(?:and|now|then|also|please|okay|ok)\b[\s,;]*)+", "", remainder, flags=re.I)
-        if not remainder or (len(remainder.split()) < 2 and remainder.lower() not in {"back", "forward", "undo", "more", "again"}):
+        if not remainder or (len(remainder.split()) < 2 and remainder.lower() not in {"back", "forward", "undo", "more", "again", "reload", "refresh", "backspace", "delete", "clear", "yes", "no", "confirm", "cancel", "sure"}):
             return None, utterance_id
         return remainder, f"{utterance_id}+{gen}"
 
@@ -107,7 +114,10 @@ class ConversationContext:
         # while preserving the newest transcript's character offsets for slicing.
         words = list(re.finditer(r"\w+(?:['’]\w+)*", text.lower()))
         consumed = re.findall(r"\w+(?:['’]\w+)*", prefix.lower())
-        if not consumed or [w.group() for w in words[:len(consumed)]] != consumed:
+        def canonical(word):
+            word = word.replace('’', "'")
+            return str(NUMBERS.get(word, ORDINALS.get(word, word)))
+        if not consumed or [canonical(w.group()) for w in words[:len(consumed)]] != [canonical(w) for w in consumed]:
             return None
         return words[len(consumed) - 1].end()
 

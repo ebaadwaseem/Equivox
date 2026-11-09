@@ -12,3 +12,5 @@ def offline_defaults(monkeypatch):
     monkeypatch.setenv("VB_MODEL", "")
     monkeypatch.setenv("VB_TRANSCRIBER", "typed")
     monkeypatch.setenv("VB_VISION", "0")
+    monkeypatch.setenv("VB_VLM_MODEL", "")
+    monkeypatch.setenv("VB_NEW_TAB_URL", "https://www.google.com/")

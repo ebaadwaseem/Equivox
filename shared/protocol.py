@@ -35,6 +35,9 @@ class Element:
     options: list[str] = field(default_factory=list)  # <select> option labels, for matching e.g. "select tuesday"
     in_chrome: bool = False  # inside <header>/<nav>/<footer> -- excluded when counting "results"
     is_homepage_link: bool = False  # link's href is the current site's own root ("/") -- a logo link
+    description: str = ""  # nearby result/card text and accessibility descriptions
+    is_video_link: bool = False
+    suggestion_group: str = ""  # visible autocomplete popup owned by an input
 
 
 @dataclass
@@ -57,6 +60,7 @@ class PageState:
 Intent = Literal[
     "click", "type", "select", "scroll", "navigate", "back", "forward", "search", "find",
     "new_tab", "close_tab", "switch_tab", "accessibility", "none",
+    "reload", "key", "clear", "route", "map_move",
 ]
 
 
@@ -88,3 +92,5 @@ class Decision:
     is_correction: bool = False        # user is reversing/redirecting the previous action
     payload_bounded: bool = False      # free text ended at a comma/semicolon, so it can commit early
     target_top_prob: float = 1.0       # probability of the picked target, for disambiguation
+    repeat_count: int = 1
+    target_probabilities: dict[str, float] = field(default_factory=dict)

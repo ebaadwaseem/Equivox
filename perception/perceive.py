@@ -13,6 +13,7 @@ from typing import Optional
 from playwright.async_api import Page
 
 from shared.protocol import Element, PageState
+from backend.choices import page_suggestions
 
 OBSERVER_JS = (Path(__file__).parent / "observer.js").read_text()
 
@@ -71,7 +72,8 @@ ROLE_WORDS: dict[str, set[str]] = {
     "input": {"textbox"}, "inputs": {"textbox"},
     "checkbox": {"checkbox"}, "checkboxes": {"checkbox"},
     "radio": {"radio"},
-    "option": {"radio", "select"}, "options": {"radio", "select"},
+    "option": {"option", "radio", "select"}, "options": {"option", "radio", "select"},
+    "video": {"link"}, "videos": {"link"},
     "dropdown": {"select"}, "select": {"select"}, "menu": {"select"},
 }
 
@@ -130,6 +132,12 @@ def _find_ordinal_target(elements: list[Element], transcript: str) -> Optional[E
         return None
     roles = _find_role_filter(transcript)
     candidates = [e for e in _dom_order(elements) if roles is None or e.role in roles]
+    if "video" in words or "videos" in words:
+        candidates = [e for e in candidates if e.is_video_link]
+    elif any(w in words for w in ("option", "options", "choose", "select")):
+        suggestions = page_suggestions(elements) or [e for e in candidates if e.role == "option" and e.in_viewport]
+        if suggestions:
+            candidates = suggestions
     if roles is not None and "link" in roles:
         # "first link"/"second result" etc. means a real, nameable piece of content --
         # never the header/nav/footer chrome around it, an icon-only link with no text,
@@ -177,7 +185,7 @@ def find_deterministic_target(elements: list[Element], transcript: str) -> Optio
 
 
 def _lexical_score(e: Element, words: set[str]) -> int:
-    name_tokens = set(_tokens(e.name))
+    name_tokens = set(_tokens(e.name + " " + e.description))
     option_tokens = {t for opt in e.options for t in _tokens(opt)}
     overlap = len(words & name_tokens)
     option_overlap = len(words & option_tokens)
@@ -247,6 +255,8 @@ def _state_suffix(e: Element) -> str:
         parts.append(f"→{e.href_domain}")
     if e.role == "select" and e.options:
         parts.append("options=[" + ",".join(e.options[:30]) + "]")
+    if e.description:
+        parts.append(f'description="{e.description[:140]}"')
     return (" " + " ".join(parts)) if parts else ""
 
 

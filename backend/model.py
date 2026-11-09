@@ -12,6 +12,7 @@ import time
 from typing import Optional, get_args
 
 from backend import jev, policy, spans
+from backend.forms import form_entry
 from backend.state_builder import build_state_text
 from perception.perceive import build_choice_criteria, find_deterministic_target
 from shared.protocol import Decision, Element, Intent
@@ -68,6 +69,10 @@ async def decide(
     pending_confirmation: Optional[str] = None,
     silent_ms: float = 0.0,
 ) -> Decision:
+    if entry := form_entry(transcript, elements):
+        entry.act_now = "utterance_complete" if is_final or silent_ms >= policy.PAYLOAD_SILENCE_MS else "incomplete"
+        entry.complete = entry.act_now == "utterance_complete"
+        return entry
     key = os.getenv("OPENROUTER_API_KEY")
     model = os.getenv("VB_MODEL", "")
     if not key or not model:
@@ -283,6 +288,7 @@ async def decide(
         is_correction=jev.noul(answers, "is_correction") >= 0.5,
         payload_bounded=spans.is_comma_bounded(transcript, text_value or ""),
         target_top_prob=target_top_prob,
+        target_probabilities={k: v for k, v in target_probs.items() if k in {e.id for e in elements}},
     )
 
 
@@ -348,10 +354,15 @@ def _keyword_fallback(transcript: str, elements: list[Element]) -> Decision:
         return Decision(True, "search", text=query)
     pinned = find_deterministic_target(elements, transcript)
     if value := spans.extract_select_value(transcript):
-        box = pinned or next((e for e in elements if e.role == "select"), None)
+        options = [e for e in elements if e.role == "option" and e.name.casefold() == value.casefold()]
+        if len(options) == 1:
+            return Decision(True, "click", target_id=options[0].id)
+        fields = [e for e in elements if e.role == "select" and (not e.options or any(value.casefold() in o.casefold() for o in e.options))]
+        box = pinned or (fields[0] if len(fields) == 1 else next((e for e in fields if e.active), None))
         return Decision(True, "select", target_id=box.id if box else None, text=value)
     if type_text := spans.extract_type_text(transcript):
-        box = pinned or next((e for e in elements if e.role == "textbox"), None)
+        fields = [e for e in elements if e.role == "textbox"]
+        box = pinned or next((e for e in fields if e.active), None) or (fields[0] if len(fields) == 1 else None)
         return Decision(True, "type", target_id=box.id if box else None, text=type_text)
     if find_text := spans.extract_find_text(transcript):
         return Decision(True, "find", text=find_text)
@@ -359,8 +370,18 @@ def _keyword_fallback(transcript: str, elements: list[Element]) -> Decision:
         return Decision(True, "accessibility", text=action)
     if pinned:
         return Decision(True, "click", target_id=pinned.id, destructive=policy.looks_destructive(pinned.name))
+    if not re.match(r"^(?:click|press|open|tap)\s+", t):
+        return Decision(False, "none")
     words = [w for w in re.sub(r"^(click|press|open|tap)\s+", "", t).split() if len(w) > 2]
-    for e in elements:
-        if any(w in e.name.lower() for w in words):
-            return Decision(True, "click", target_id=e.id, destructive=policy.looks_destructive(e.name))
-    return Decision(False, "none")
+    query = re.sub(r"^(click|press|open|tap)\s+(?:the\s+)?", "", t)
+    scored = [(e, 100 if query == e.name.casefold() else sum(w in e.name.casefold() for w in words)) for e in elements]
+    scored = [(e, score) for e, score in scored if score > 0]
+    if not scored:
+        return Decision(False, "none")
+    best = max(score for _, score in scored)
+    matches = [e for e, score in scored if score == best]
+    total = sum(score for _, score in scored)
+    return Decision(True, "click", target_id=matches[0].id if len(matches) == 1 else None,
+                    ambiguous=len(matches) != 1,
+                    destructive=len(matches) == 1 and policy.looks_destructive(matches[0].name),
+                    target_probabilities={e.id: score / total for e, score in scored})

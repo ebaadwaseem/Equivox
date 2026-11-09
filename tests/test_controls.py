@@ -56,15 +56,16 @@ def test_native_select_shadow_editor_and_frame_input():
     asyncio.run(run())
 
 
-def test_new_blank_tab_search_uses_the_new_page_and_encodes_the_query():
+def test_new_home_tab_search_uses_the_new_page_and_encodes_the_query():
     async def run():
         async with async_playwright() as p:
             browser = await p.chromium.launch()
             context = await browser.new_context()
             original = await context.new_page()
+            await context.route('https://www.google.com/**', lambda route: route.fulfill(body='<h1>Google</h1>', content_type='text/html'))
             page = await new_tab(context)
             assert page is not original
-            assert page.url == "about:blank"
+            assert page.url == "https://www.google.com/"
             urls = []
             async def search_route(route):
                 urls.append(route.request.url)
