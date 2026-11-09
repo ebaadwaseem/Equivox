@@ -1,5 +1,5 @@
 """Pure-function helpers from main.py."""
-from main import _consumed_prefix, _parse_ordinal_reply
+from main import _apply_asr_aliases, _consumed_prefix, _parse_ordinal_reply, _strip_filler
 
 
 def test_parse_ordinal_reply_bare_digit():
@@ -61,3 +61,31 @@ def test_consumed_prefix_finds_the_sliced_remainder_after_the_old_prefix():
 
 def test_consumed_prefix_falls_back_to_the_current_text_on_a_rewrite():
     assert _consumed_prefix("scroll down", "scroll up", None, True) == "scroll up"
+
+
+def test_strip_filler_removes_um_and_uh():
+    assert _strip_filler("um") == ""
+    assert _strip_filler("uh um") == ""
+    assert _strip_filler("   ") == ""
+
+
+def test_strip_filler_keeps_real_content_alongside_filler():
+    assert _strip_filler("um scroll down") == "scroll down"
+
+
+def test_asr_alias_search_tabs_becomes_next_tab():
+    assert _apply_asr_aliases("search tab") == "next tab"
+    assert _apply_asr_aliases("search tabs") == "next tab"
+
+
+def test_asr_alias_next_tap_becomes_next_tab():
+    assert _apply_asr_aliases("next tap") == "next tab"
+
+
+def test_asr_alias_close_the_tap_becomes_close_tab():
+    assert _apply_asr_aliases("close the tap") == "close tab"
+
+
+def test_asr_alias_leaves_unrelated_text_unchanged():
+    assert _apply_asr_aliases("tap the button") == "tap the button"
+    assert _apply_asr_aliases("scroll down") == "scroll down"

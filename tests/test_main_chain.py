@@ -625,3 +625,105 @@ def test_filler_only_transcript_never_reaches_decide(monkeypatch):
     # the filler-only/whitespace-only transcripts never reached decide() at all --
     # only the real command did
     assert decided == ["scroll down"]
+
+
+def test_wait_on_final_with_plausible_guess_asks_did_you_mean_then_confirms(monkeypatch):
+    done = asyncio.Event()
+    states = []
+    executed = []
+
+    async def fake_decide(text, is_final, elements_text, cands, **kwargs):
+        if "yes" in text.lower():
+            # only reached if "yes" wrongly fell through to decide() instead of being
+            # intercepted by the pending confirm -- proves the confirm, not a fresh
+            # decision, is what gets executed
+            return _act("click")
+        # low intent_confidence -> WAIT on a final, but with a perfectly plausible guess
+        return _act("scroll", scroll_amount=0.8, intent_confidence=0.4, act_now="utterance_complete")
+
+    async def fake_execute(page, d):
+        executed.append(d.intent)
+        done.set()
+        return "Scrolling down"
+
+    async def set_trace(page, state, text=""):
+        states.append((state, text))
+
+    _install(monkeypatch, fake_decide, fake_execute, [
+        (0, Transcript("scrawl down", True)),
+        (.2, Transcript("yes", True)),
+    ])
+    monkeypatch.setattr(main.vox, "set", set_trace)
+    _run_until(done)
+    assert any(s == "unsure" and "Did you mean" in txt for s, txt in states)
+    assert executed == ["scroll"]  # the ORIGINAL guess ran, "yes" was never re-decided
+
+
+def test_wait_on_final_with_no_plausible_guess_shows_error_hint(monkeypatch):
+    done = asyncio.Event()
+    errors = []
+
+    async def fake_decide(text, is_final, elements_text, cands, **kwargs):
+        # a payload intent with NO text -- "incomplete"-style, nothing to confirm
+        return _act("search", text=None, act_now="utterance_complete")
+
+    async def never_execute(page, d):
+        raise AssertionError("nothing plausible was found -- execute() must never run")
+
+    async def set_then_idle_after(page, state, text, delay=1.5):
+        errors.append((state, text))
+        done.set()
+
+    _install(monkeypatch, fake_decide, never_execute, [(0, Transcript("search for", True))])
+    monkeypatch.setattr(main.vox, "set_then_idle_after", set_then_idle_after)
+    _run_until(done)
+    assert errors and errors[0][0] == "error"
+    assert "didn't catch a command" in errors[0][1]
+
+
+def test_borderline_ignore_on_final_asks_for_clarification(monkeypatch):
+    done = asyncio.Event()
+    states = []
+
+    async def fake_decide(text, is_final, elements_text, cands, **kwargs):
+        return _act("scroll", scroll_amount=0.8, is_command_confidence=0.4, act_now="utterance_complete")
+
+    async def never_execute(page, d):
+        raise AssertionError("a borderline ignore must ask, not act")
+
+    async def set_trace(page, state, text=""):
+        states.append((state, text))
+        if state == "unsure":
+            done.set()
+
+    _install(monkeypatch, fake_decide, never_execute, [(0, Transcript("scrawl down", True))])
+    monkeypatch.setattr(main.vox, "set", set_trace)
+    _run_until(done)
+    assert any(s == "unsure" and "Did you mean" in txt for s, txt in states)
+
+
+def test_confident_ignore_on_final_stays_silent(monkeypatch):
+    done = asyncio.Event()
+    states = []
+
+    async def fake_decide(text, is_final, elements_text, cands, **kwargs):
+        if "couch" in text:
+            return _act("none", is_command=False, is_command_confidence=0.1, act_now="not_a_command")
+        return _act("scroll", scroll_amount=0.8, act_now="utterance_complete")
+
+    async def fake_execute(page, d):
+        done.set()
+        return "Scrolling down"
+
+    async def set_trace(page, state, text=""):
+        states.append((state, text))
+
+    _install(monkeypatch, fake_decide, fake_execute, [
+        (0, Transcript("that's a nice couch", True)),
+        (.2, Transcript("scroll down", True)),
+    ])
+    monkeypatch.setattr(main.vox, "set", set_trace)
+    _run_until(done)
+    # the confident non-command never showed unsure/error -- only listening/thinking/idle
+    assert not any(s in ("unsure", "error") for s, _ in states)
+

@@ -66,6 +66,23 @@ def _strip_filler(text: str) -> str:
     return " ".join(w for w in text.split() if w.strip(".,!?").lower() not in FILLER_WORDS)
 
 
+# Common ASR mishearings seen in real voice sessions -- corrected deterministically,
+# before Jev or any shortcut parsing ever sees the transcript.
+_ASR_ALIASES = (
+    (re.compile(r"^search tabs?$", re.I), "next tab"),
+    (re.compile(r"^next tap$", re.I), "next tab"),
+    (re.compile(r"^close the tap$", re.I), "close tab"),
+)
+
+
+def _apply_asr_aliases(text: str) -> str:
+    stripped = text.strip()
+    for pattern, replacement in _ASR_ALIASES:
+        if pattern.fullmatch(stripped):
+            return replacement
+    return text
+
+
 def _site_of(url: str) -> str:
     try:
         return (urlsplit(url).hostname or "").removeprefix("www.")
@@ -452,7 +469,7 @@ async def main() -> None:
                 first_seen_ts.setdefault(physical_id, t_start)
                 if t.is_final:
                     final_seen_ts[physical_id] = t_start
-            raw_text = " ".join(t.text.split())
+            raw_text = _apply_asr_aliases(" ".join(t.text.split()))
             t = Transcript(raw_text, t.is_final, t.confidence, t.id, t.silent_ms)
             # Keep the physical transcript throughout buffering and continuation.
             physical = t
@@ -503,6 +520,38 @@ async def main() -> None:
                 context.consume(physical_id, prefix)
                 # Even a single final containing several clauses must drain itself.
                 buffered_transcripts[physical_id] = latest_transcripts.get(physical_id, physical)
+
+            async def _unclear_final(d: Decision, target_name: str) -> None:
+                # A FINAL transcript that ends in WAIT/a borderline IGNORE is a user who
+                # finished speaking and got silence back -- never just go idle. If Jev
+                # had a plausible top guess, ask about it (yes/no); otherwise say so.
+                # "plausible" excludes a structurally incomplete guess (act_now=
+                # "incomplete", or a payload/target intent missing its text/target) --
+                # there's nothing coherent to ask "did you mean X?" about in that case.
+                nonlocal pending
+                has_target = d.intent not in {"click", "type", "select"} or bool(d.target_id)
+                has_payload = d.intent not in policy.PAYLOAD_INTENTS or bool(d.text)
+                plausible = (
+                    d.intent and d.intent != "none" and d.act_now != "incomplete"
+                    and has_target and has_payload
+                )
+                if plausible:
+                    question = vox.describe_action(d, target_name)
+                    print(f'  ❓ Did you mean: {question}? Say yes or no.')
+                    await vox.set(active_page, "unsure", f"Did you mean: {question}? Say yes or no")
+                    pending = {
+                        "kind": "confirm", "decision": d, "target_name": target_name,
+                        "said": t.text, "physical_id": physical_id,
+                        "prefix": _executed_prefix(t, d),
+                        "page": active_page, "url": active_page.url,
+                    }
+                    context.consume(physical_id, prefix)
+                else:
+                    await vox.set_then_idle_after(
+                        active_page, "error",
+                        "I didn't catch a command. Try \"scroll down\" or \"click …\".",
+                        delay=ERROR_REVERT_S,
+                    )
 
             # UI-only meta-commands: deterministic, never go through Jev.
             if text_norm in SHOW_STATS_PHRASES:
@@ -872,11 +921,17 @@ async def main() -> None:
 
             if outcome == "IGNORE":
                 if t.is_final:
-                    await vox.set(active_page, "idle")
+                    # A confident non-command (chit-chat, clearly not addressed to the
+                    # browser) stays silent; a BORDERLINE one -- is_command landed just
+                    # under the commit bar -- is a user who probably meant something.
+                    if 0.35 <= d.is_command_confidence < policy.IS_COMMAND_THRESHOLD:
+                        await _unclear_final(d, target_name)
+                    else:
+                        await vox.set(active_page, "idle")
                 return
             if outcome == "WAIT":
                 if t.is_final:
-                    await vox.set(active_page, "idle")
+                    await _unclear_final(d, target_name)
                 else:
                     schedule_silence(t, raw_text, result.retry_in_ms, physical_id)
                 return
